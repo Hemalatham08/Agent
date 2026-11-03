@@ -282,3 +282,40 @@ def search_products(search_text):
         query,
         (search_pattern,) * 5
     )
+
+def get_stock_by_product_name(product_name):
+    # Step 1: Search for the product
+    products = search_products(product_name)
+
+    # Step 2: Find an exact product name match
+    exact_matches = [
+        product for product in products
+        if product["product_name"].lower() == product_name.strip().lower()
+    ]
+
+    # Step 3: Handle missing products
+    if not exact_matches:
+        return {
+            "error": "Product not found",
+            "product_name": product_name
+        }
+
+    # Step 4: Handle ambiguous results
+    if len(exact_matches) > 1:
+        return {
+            "error": "Multiple matching products found",
+            "products": exact_matches
+        }
+
+    # Step 5: Extract the real product ID
+    product = exact_matches[0]
+    product_id = product["product_id"]
+
+    # Step 6: Retrieve actual inventory
+    inventory = get_inventory_status(product_id)
+
+    # Step 7: Return product and inventory together
+    return {
+        "product": product,
+        "inventory": inventory
+    }

@@ -14,6 +14,7 @@ from tools.database import (
     get_unpaid_invoices,
     get_invoice_outstanding,
     search_products,
+    get_stock_by_product_name,
 )
 
 
@@ -22,6 +23,25 @@ from tools.database import (
 # --------------------------------------------------
 
 tools = [
+    
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_by_product_name",
+            "description": "Get actual stock quantities for a product using its exact product name. Use this for stock questions when the user provides a product name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {
+                        "type": "string",
+                        "description": "Exact product name, such as Hex Bolt M10"
+                    }
+                },
+                "required": ["product_name"]
+            }
+        }
+    },
+
     {
         "type": "function",
         "function": {
@@ -152,6 +172,7 @@ available_functions = {
     "get_quality_issues": get_quality_issues,
     "get_unpaid_invoices": get_unpaid_invoices,
     "search_products": search_products,
+    "get_stock_by_product_name":get_stock_by_product_name,
 }
 
 
@@ -216,7 +237,11 @@ Rules:
         messages.append(response.message)
 
         # If the AI doesn't request a tool, return its answer
+        # if not response.message.tool_calls:
+        #     return response.message.content, messages
         if not response.message.tool_calls:
+            print("\nAI ANSWERED WITHOUT USING A TOOL")
+            print(response.message.content)
             return response.message.content, messages
 
         # Execute requested ERP tools
@@ -224,7 +249,9 @@ Rules:
 
             function_name = tool_call.function.name
             arguments = tool_call.function.arguments
-
+            print("\nAI IS CALLING A TOOL")
+            print("Function:", function_name)
+            print("Arguments:", arguments)
             if function_name not in available_functions:
                 result = {"error": "Unknown ERP tool"}
             else:
@@ -236,7 +263,8 @@ Rules:
 
             # Convert result to JSON
             result_json = json.dumps(result, default=str)
-
+            print("DATABASE RESULT")
+            print(result_json)
             # Send ERP result back to the AI
             messages.append({
                 "role": "tool",
