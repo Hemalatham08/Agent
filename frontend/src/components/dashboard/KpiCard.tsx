@@ -18,6 +18,7 @@ interface KpiCardProps {
   helper: string
   icon: LucideIcon
   tone?: KpiTone
+  loading?: boolean
 }
 
 export function KpiCard({
@@ -26,6 +27,7 @@ export function KpiCard({
   helper,
   icon: Icon,
   tone = 'blue',
+  loading = false,
 }: KpiCardProps) {
   const styles = toneStyles[tone]
 
@@ -34,8 +36,12 @@ export function KpiCard({
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-[12px] font-medium text-slate-500">{label}</p>
-          <p className={`mt-2 text-2xl font-bold tracking-tight ${styles.value}`}>
-            {value}
+          <p
+            className={`mt-2 text-2xl font-bold tracking-tight ${
+              loading ? 'animate-pulse text-slate-300' : styles.value
+            }`}
+          >
+            {loading ? '—' : value}
           </p>
         </div>
         <div
@@ -44,7 +50,9 @@ export function KpiCard({
           <Icon className="h-5 w-5" strokeWidth={2} />
         </div>
       </div>
-      <p className="mt-3 text-[11px] font-medium text-slate-400">{helper}</p>
+      <p className="mt-3 text-[11px] font-medium text-slate-400">
+        {loading ? 'Loading live data…' : helper}
+      </p>
     </Card>
   )
 }

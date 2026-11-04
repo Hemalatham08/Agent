@@ -34,6 +34,16 @@ export interface LowStockItem {
   reorder_level: number
 }
 
+export interface InventoryStatus {
+  product_id: string
+  product_name: string
+  warehouse_name: string
+  on_hand_qty: number
+  reserved_qty: number
+  free_stock: number
+  reorder_level: number
+}
+
 export interface SalesOrder {
   so_id: string
   customer_id: string
@@ -101,6 +111,11 @@ export interface InventoryChartPoint {
 export interface SalesChartPoint {
   label: string
   sales: number
+}
+
+export interface PendingOrdersChartPoint {
+  label: string
+  orders: number
 }
 
 export type AlertSeverity = 'critical' | 'warning' | 'info'

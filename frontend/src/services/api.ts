@@ -1,5 +1,6 @@
 import type {
   DispatchIssue,
+  InventoryStatus,
   Invoice,
   LowStockItem,
   Product,
@@ -11,6 +12,21 @@ import type {
 export const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 ).replace(/\/$/, '')
+
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatRequest {
+  question: string
+  history: ChatMessage[]
+}
+
+export interface ChatResponse {
+  answer: string
+  model: string
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -41,11 +57,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const erpApi = {
+  chat: (payload: ChatRequest) =>
+    request<ChatResponse>('/chat', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   getProducts: () => request<Product[]>('/products'),
   getProduct: (productId: string) =>
     request<Product>(`/products/${encodeURIComponent(productId)}`),
   getInventory: (productId: string) =>
-    request<LowStockItem[]>(`/inventory/${encodeURIComponent(productId)}`),
+    request<InventoryStatus[]>(`/inventory/${encodeURIComponent(productId)}`),
   getLowStock: () => request<LowStockItem[]>('/inventory/alerts/low-stock'),
   getPendingSalesOrders: () => request<SalesOrder[]>('/sales/pending'),
   getPendingPurchaseOrders: () => request<PurchaseOrder[]>('/purchase/pending'),
