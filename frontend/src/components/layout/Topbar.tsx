@@ -52,7 +52,7 @@ export function Topbar({ onMenuClick }: TopbarProps) {
           </div>
 
           <span className="hidden rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-600/20 sm:inline-flex">
-            Demo data
+            Live data
           </span>
 
           <button

@@ -105,8 +105,9 @@ export default function AIAssistant() {
         : 'Ready'
 
   return (
-    <>
+    <div className="-my-6 flex h-[calc(100dvh-4rem)] min-h-0 flex-col overflow-hidden py-6 lg:-my-8 lg:py-8">
       <PageHeader
+        className="mb-3 shrink-0 gap-2 sm:mb-4"
         title="AI Assistant"
         description="An ERP-aware copilot that answers natural-language questions using live business data."
         eyebrow="iFive Copilot"
@@ -138,13 +139,13 @@ export default function AIAssistant() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[1fr_340px]">
-        <Card className="flex min-h-[660px] flex-col overflow-hidden">
-          <div className="flex items-center gap-3 border-b border-slate-100 px-5 py-4">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-hidden xl:grid-cols-[1fr_340px] xl:gap-5">
+        <Card className="flex min-h-0 flex-col overflow-hidden">
+          <div className="flex shrink-0 items-center gap-3 border-b border-slate-100 px-5 py-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-navy-900 text-white">
               <Bot className="h-5 w-5" />
             </div>
-            <div>
+            <div className="min-w-0">
               <p className="text-sm font-semibold text-slate-900">iFive Copilot</p>
               <p className="text-[11px] text-slate-400">
                 ERP assistant powered by local Ollama models
@@ -155,20 +156,20 @@ export default function AIAssistant() {
             </span>
           </div>
 
-          <div className="scrollbar-thin flex-1 space-y-5 overflow-y-auto bg-slate-50/40 p-5">
+          <div className="scrollbar-thin flex-1 space-y-4 overflow-y-auto bg-slate-50/40 p-4 sm:p-5">
             {messages.length === 0 && !isLoading ? (
-              <div className="flex min-h-[420px] flex-col items-center justify-center px-6 text-center">
-                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-50 text-accent-600">
-                  <Sparkles className="h-7 w-7" />
+              <div className="flex h-full min-h-0 flex-col items-center justify-center px-4 py-6 text-center">
+                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-50 text-accent-600 sm:h-14 sm:w-14">
+                  <Sparkles className="h-6 w-6 sm:h-7 sm:w-7" />
                 </div>
-                <p className="mt-4 text-sm font-semibold text-slate-800">
+                <p className="mt-3 text-sm font-semibold text-slate-800">
                   Ask about your ERP data
                 </p>
                 <p className="mt-1 max-w-sm text-xs leading-5 text-slate-500">
                   Query inventory, sales orders, purchase orders, dispatch exceptions,
                   quality results, and outstanding invoices in plain language.
                 </p>
-                <p className="mt-4 text-[10px] font-medium text-slate-400">
+                <p className="mt-3 text-[10px] font-medium text-slate-400">
                   Pick a suggested question or type your own below.
                 </p>
               </div>
@@ -246,7 +247,7 @@ export default function AIAssistant() {
             )}
           </div>
 
-          <div className="border-t border-slate-100 bg-white p-4">
+          <div className="shrink-0 border-t border-slate-100 bg-white p-3 sm:p-4">
             <form
               onSubmit={handleSubmit}
               className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-2"
@@ -259,7 +260,7 @@ export default function AIAssistant() {
                 onKeyDown={handleKeyDown}
                 disabled={isLoading}
                 placeholder="Ask about inventory, orders, invoices..."
-                className="max-h-24 min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-slate-400"
+                className="max-h-20 min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-slate-400"
               />
               <button
                 type="submit"
@@ -274,21 +275,21 @@ export default function AIAssistant() {
                 )}
               </button>
             </form>
-            <p className="mt-2 flex items-center justify-center gap-1.5 text-center text-[10px] text-slate-400">
+            <p className="mt-1.5 flex items-center justify-center gap-1.5 text-center text-[10px] text-slate-400">
               <Database className="h-3 w-3" />
               Answers are generated from ERP records returned by backend tools.
             </p>
           </div>
         </Card>
 
-        <div className="space-y-5">
-          <Card>
+        <div className="flex min-h-0 flex-col gap-4 overflow-hidden xl:gap-5">
+          <Card className="flex min-h-0 shrink flex-col overflow-hidden">
             <CardHeader
               title="Suggested questions"
               description="Click a prompt to add it to the composer"
               icon={MessageSquare}
             />
-            <div className="space-y-1 px-3 pb-4">
+            <div className="scrollbar-thin min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-3">
               {suggestedQuestions.map((question) => (
                 <button
                   key={question}
@@ -298,7 +299,7 @@ export default function AIAssistant() {
                     inputRef.current?.focus()
                   }}
                   disabled={isLoading}
-                  className="group flex w-full items-start gap-2 rounded-xl px-2.5 py-2 text-left text-[11px] leading-5 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="group flex w-full items-start gap-2 rounded-xl px-2.5 py-1.5 text-left text-[11px] leading-5 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <ArrowRight className="mt-1 h-3 w-3 shrink-0 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-accent-500" />
                   <span>{question}</span>
@@ -307,13 +308,13 @@ export default function AIAssistant() {
             </div>
           </Card>
 
-          <Card>
+          <Card className="flex min-h-0 shrink-0 flex-col overflow-hidden">
             <CardHeader
               title="How it works"
               description="Live agent workflow"
               icon={Zap}
             />
-            <ol className="space-y-3 px-5 pb-5">
+            <ol className="space-y-2 px-5 pb-4">
               {[
                 'Ask a question in natural language.',
                 'The agent selects an ERP data tool.',
@@ -329,13 +330,13 @@ export default function AIAssistant() {
             </ol>
           </Card>
 
-          <Card>
+          <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <CardHeader
               title="Backend status"
               description="Live integration"
               icon={Database}
             />
-            <div className="space-y-3 px-5 pb-5">
+            <div className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-y-auto px-5 pb-4">
               <div
                 className={`flex items-center gap-2 rounded-xl px-3 py-2.5 ${
                   error ? 'bg-rose-50' : 'bg-emerald-50'
@@ -389,6 +390,6 @@ export default function AIAssistant() {
           </Card>
         </div>
       </div>
-    </>
+    </div>
   )
 }
