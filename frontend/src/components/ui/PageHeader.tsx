@@ -6,6 +6,7 @@ interface PageHeaderProps {
   description: string
   eyebrow?: string
   actions?: ReactNode
+  className?: string
 }
 
 export function PageHeader({
@@ -13,9 +14,12 @@ export function PageHeader({
   description,
   eyebrow = 'ABC Fasteners & Industrial Supplies',
   actions,
+  className = '',
 }: PageHeaderProps) {
   return (
-    <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+    <div
+      className={`mb-6 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between ${className}`}
+    >
       <div>
         <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent-600">
           {eyebrow}

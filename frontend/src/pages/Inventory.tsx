@@ -1,12 +1,17 @@
 import {
   AlertTriangle,
   Boxes,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   Layers,
   RefreshCw,
+  Search,
   Warehouse,
+  X,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import { KpiCard } from '../components/dashboard/KpiCard'
 import { Card, CardHeader } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
@@ -19,14 +24,27 @@ interface InventoryLedgerRow extends InventoryStatus {
   sku: string
 }
 
+const PAGE_SIZE = 6
+
 export default function Inventory() {
   const [rows, setRows] = useState<InventoryLedgerRow[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [warehouseFilter, setWarehouseFilter] = useState('all')
+  const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'healthy'>('all')
+  const [page, setPage] = useState(1)
 
   const reload = useCallback(() => {
     setReloadKey((key) => key + 1)
+  }, [])
+
+  const clearFilters = useCallback(() => {
+    setSearchQuery('')
+    setWarehouseFilter('all')
+    setStockFilter('all')
+    setPage(1)
   }, [])
 
   useEffect(() => {
@@ -113,6 +131,64 @@ export default function Inventory() {
   const metricValue = (value: number) =>
     error !== null && !hasData ? '—' : formatNumber(value)
 
+  const warehouseOptions = useMemo(
+    () =>
+      Array.from(new Set(rows.map((row) => row.warehouse_name))).sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    [rows],
+  )
+
+  const normalizedQuery = searchQuery.trim().toLowerCase()
+
+  const filteredRows = useMemo(() => {
+    return rows.filter((row) => {
+      const isLowStock = row.free_stock <= row.reorder_level
+
+      if (warehouseFilter !== 'all' && row.warehouse_name !== warehouseFilter) {
+        return false
+      }
+
+      if (stockFilter === 'low' && !isLowStock) {
+        return false
+      }
+
+      if (stockFilter === 'healthy' && isLowStock) {
+        return false
+      }
+
+      if (normalizedQuery) {
+        const haystack = [
+          row.product_name,
+          row.product_id,
+          row.sku,
+          row.warehouse_name,
+        ]
+          .join(' ')
+          .toLowerCase()
+
+        if (!haystack.includes(normalizedQuery)) {
+          return false
+        }
+      }
+
+      return true
+    })
+  }, [normalizedQuery, rows, stockFilter, warehouseFilter])
+
+
+
+  const totalRecords = rows.length
+  const filteredCount = filteredRows.length
+  const totalPages = Math.max(1, Math.ceil(filteredCount / PAGE_SIZE))
+  const currentPage = Math.min(page, totalPages)
+  const pageStartIndex = (currentPage - 1) * PAGE_SIZE
+  const paginatedRows = filteredRows.slice(pageStartIndex, pageStartIndex + PAGE_SIZE)
+  const hasActiveFilters =
+    normalizedQuery.length > 0 || warehouseFilter !== 'all' || stockFilter !== 'all'
+  const showingFrom = filteredCount === 0 ? 0 : pageStartIndex + 1
+  const showingTo = Math.min(pageStartIndex + PAGE_SIZE, filteredCount)
+
   return (
     <>
       <PageHeader
@@ -197,10 +273,96 @@ export default function Inventory() {
           icon={Boxes}
           action={
             <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-semibold text-slate-500">
-              {isLoading ? 'Loading…' : `${formatNumber(rows.length)} stock records`}
+              {isLoading
+                ? 'Loading…'
+                : hasActiveFilters
+                  ? `${formatNumber(filteredCount)} of ${formatNumber(totalRecords)} stock records`
+                  : `${formatNumber(totalRecords)} stock records`}
             </span>
           }
         />
+
+        <div className="border-y border-slate-100 bg-slate-50/40 px-5 py-4">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center">
+            <div className="relative min-w-0 flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(event) => {
+                  setSearchQuery(event.target.value)
+                  setPage(1)
+                }}
+                placeholder="Search by product, product ID, SKU, or warehouse"
+                className="h-10 w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-9 text-xs text-slate-700 outline-none transition placeholder:text-slate-400 focus:border-accent-300 focus:ring-4 focus:ring-accent-50"
+                aria-label="Search stock ledger"
+              />
+              {searchQuery ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery('')
+                    setPage(1)
+                  }}
+                  className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  aria-label="Clear search"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+            </div>
+
+            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap xl:justify-end">
+              <select
+                value={warehouseFilter}
+                onChange={(event) => {
+                  setWarehouseFilter(event.target.value)
+                  setPage(1)
+                }}
+                className="h-10 min-w-[180px] rounded-xl border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 outline-none transition focus:border-accent-300 focus:ring-4 focus:ring-accent-50"
+                aria-label="Filter by warehouse"
+              >
+                <option value="all">All Warehouses</option>
+                {warehouseOptions.map((warehouse) => (
+                  <option key={warehouse} value={warehouse}>
+                    {warehouse}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={stockFilter}
+                onChange={(event) => {
+                  setStockFilter(event.target.value as 'all' | 'low' | 'healthy')
+                  setPage(1)
+                }}
+                className="h-10 min-w-[150px] rounded-xl border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 outline-none transition focus:border-accent-300 focus:ring-4 focus:ring-accent-50"
+                aria-label="Filter by stock status"
+              >
+                <option value="all">All Statuses</option>
+                <option value="low">Low Stock</option>
+                <option value="healthy">Healthy</option>
+              </select>
+
+              <button
+                type="button"
+                onClick={clearFilters}
+                disabled={!hasActiveFilters}
+                className="inline-flex h-10 items-center justify-center rounded-xl border border-slate-200 bg-white px-4 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Clear Filters
+              </button>
+            </div>
+          </div>
+
+          {!isLoading ? (
+            <p className="mt-3 text-[11px] text-slate-500">
+              {hasActiveFilters
+                ? `Showing ${formatNumber(filteredCount)} of ${formatNumber(totalRecords)} stock records`
+                : `Showing ${formatNumber(totalRecords)} stock records`}
+            </p>
+          ) : null}
+        </div>
 
         <div className="scrollbar-thin overflow-x-auto">
           <table className="min-w-full text-left text-sm">
@@ -225,8 +387,23 @@ export default function Inventory() {
                     ? 'Inventory data unavailable.'
                     : 'No inventory records found.'}
                 </TableMessage>
+              ) : filteredRows.length === 0 ? (
+                <tr>
+                  <td className="px-5 py-10 text-center" colSpan={8}>
+                    <p className="text-xs font-medium text-slate-500">
+                      No inventory records match your filters.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={clearFilters}
+                      className="mt-3 inline-flex items-center justify-center rounded-lg bg-accent-50 px-3 py-1.5 text-[11px] font-semibold text-accent-700 transition hover:bg-accent-100"
+                    >
+                      Clear filters
+                    </button>
+                  </td>
+                </tr>
               ) : (
-                rows.map((row) => {
+                paginatedRows.map((row) => {
                   const isLowStock = row.free_stock <= row.reorder_level
 
                   return (
@@ -274,12 +451,53 @@ export default function Inventory() {
             </tbody>
           </table>
         </div>
+
+        {!isLoading && rows.length > 0 && filteredRows.length > 0 ? (
+          <div className="flex flex-col gap-3 border-t border-slate-100 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-[11px] text-slate-500">
+              Showing{' '}
+              <span className="font-semibold text-slate-700">
+                {formatNumber(showingFrom)}–{formatNumber(showingTo)}
+              </span>{' '}
+              of{' '}
+              <span className="font-semibold text-slate-700">
+                {formatNumber(filteredCount)}
+              </span>{' '}
+              {hasActiveFilters ? 'filtered records' : 'records'}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setPage((current) => Math.max(1, current - 1))}
+                disabled={currentPage === 1}
+                className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                Previous
+              </button>
+              <span className="px-1 text-[11px] font-medium text-slate-500">
+                Page {currentPage} of {totalPages}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  setPage((current) => Math.min(totalPages, current + 1))
+                }
+                disabled={currentPage === totalPages}
+                className="inline-flex h-8 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Next
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        ) : null}
       </Card>
     </>
   )
 }
 
-function TableMessage({ children }: { children: string }) {
+function TableMessage({ children }: { children: ReactNode }) {
   return (
     <tr>
       <td className="px-5 py-10 text-center text-xs font-medium text-slate-400" colSpan={8}>
