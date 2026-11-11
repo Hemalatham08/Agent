@@ -9,7 +9,7 @@
 
 # print("\nAI ANSWER:")
 # print(answer)
-from agent import ask_erp
+from backend.legacy.agent import ask_erp
 
 print("\n========== ERP AI AGENT ==========")
 print("Type 'hakuna matata' at any time to exit.\n")

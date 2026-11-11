@@ -1,6 +1,13 @@
 
-from fastapi import FastAPI, HTTPException
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from backend.agent.erp.platform import ErpToolPlatform
+from backend.agent.services.agent_service import AgentService
 from backend.tools.database import (
     get_all_products,
     get_product_by_id,
@@ -14,11 +21,41 @@ from backend.tools.database import (
     get_invoice_outstanding,
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    platform: ErpToolPlatform | None = None
+    agent_service: AgentService | None = None
+    app.state.erp_tools = None
+    app.state.erp_runner = None
+    app.state.agent_service = None
+    try:
+        platform = ErpToolPlatform.from_env()
+        agent_service = AgentService.from_platform(platform)
+        app.state.erp_tools = platform
+        app.state.erp_runner = platform.runner
+        app.state.agent_service = agent_service
+        yield
+    finally:
+        try:
+            if agent_service is not None:
+                agent_service.close()
+        finally:
+            try:
+                if platform is not None:
+                    platform.close()
+            finally:
+                app.state.erp_tools = None
+                app.state.erp_runner = None
+                app.state.agent_service = None
+
+
 # Create the FastAPI application
 app = FastAPI(
     title="iFive AI ERP Agent API",
     description="API for ABC Fasteners ERP demo system",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -46,6 +83,7 @@ def product(product_id: str):
         raise HTTPException(status_code=404, detail="Product not found")
 
     return result
+
 
 
 # 3. Get inventory for a product
@@ -99,3 +137,68 @@ def invoice_outstanding(invoice_id: str):
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 11. AI Agent Chat Endpoints (Phase 3E)
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    message: str | None = None
+    question: str | None = None
+    session_id: str | None = None
+    history: list[dict[str, Any]] | None = None
+
+
+class ToolCallSummaryResponse(BaseModel):
+    tool_name: str
+    status: str
+    duration_ms: float | None = None
+    error: str | None = None
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    tool_calls: list[ToolCallSummaryResponse] = Field(default_factory=list)
+    status: str
+    model: str
+    error: str | None = None
+
+
+@app.post("/api/agent/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(request: ChatRequest, req: Request):
+    text = (request.message or request.question or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Question or message must not be empty.")
+
+    agent_service: AgentService | None = getattr(req.app.state, "agent_service", None)
+    if agent_service is None:
+        platform: ErpToolPlatform | None = getattr(req.app.state, "erp_tools", None)
+        if platform is not None:
+            agent_service = AgentService.from_platform(platform)
+            req.app.state.agent_service = agent_service
+        else:
+            raise HTTPException(status_code=503, detail="Agent service is not available.")
+
+    result = agent_service.answer_question(text, session_id=request.session_id)
+
+    tool_summaries = [
+        ToolCallSummaryResponse(
+            tool_name=tc.tool_name,
+            status=tc.status,
+            duration_ms=tc.duration_ms,
+            error=tc.error,
+        )
+        for tc in result.tool_calls
+    ]
+
+    model_name = getattr(agent_service.client.config, "model", "llama3.2")
+
+    return ChatResponse(
+        answer=result.answer,
+        tool_calls=tool_summaries,
+        status=result.status,
+        model=model_name,
+        error=result.error,
+    )
