@@ -134,14 +134,14 @@ class TestChatApi(unittest.TestCase):
                 {
                     "thought": "Answer directly",
                     "action": "final_answer",
-                    "final_answer": "Hex Bolt M10 is in stock.",
+                    "final_answer": "Hello! I am your ERP assistant.",
                 }
             ]
         )
-        # Using frontend style `question`
-        response = chat_endpoint(ChatRequest(question="Stock of Hex Bolt"), req)
+        # Using frontend style `question` for a non-factual greeting.
+        response = chat_endpoint(ChatRequest(question="Hello"), req)
         self.assertEqual(response.status, "completed")
-        self.assertEqual(response.answer, "Hex Bolt M10 is in stock.")
+        self.assertEqual(response.answer, "Hello! I am your ERP assistant.")
         self.assertEqual(len(response.tool_calls), 0)
 
     def test_chat_model_unavailable_returns_sanitized_error(self) -> None:

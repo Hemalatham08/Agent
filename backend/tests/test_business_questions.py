@@ -322,10 +322,11 @@ class TestBusinessQuestions(unittest.TestCase):
             ]
         )
         res = orchestrator.process_question("Show dispatch details for DSP999.")
-        self.assertEqual(res.status, "completed")
+        self.assertEqual(res.status, "error")
+        self.assertEqual(res.error, "tool_evidence_failed")
         self.assertEqual(len(res.tool_calls), 1)
         self.assertEqual(res.tool_calls[0].status, "failed")
-        self.assertIn("DSP999", res.answer)
+        self.assertIn("could not retrieve verified ERP data", res.answer)
 
     def test_delivery_answer_must_not_fabricate_delivery(self) -> None:
         # Delivery-vs-dispatch safety: even if the model is asked directly about
@@ -398,6 +399,17 @@ class TestDispatchPromptSemantics(unittest.TestCase):
         )
 
 
+class TestProductPromptSemantics(unittest.TestCase):
+    """The system prompt must teach single-call product listing."""
+
+    def test_system_prompt_documents_single_call_product_listing(self) -> None:
+        prompt = build_system_prompt(
+            [d.model_dump() for d in ERP_TOOL_DEFINITIONS]
+        )
+        self.assertIn("erp.products.search", prompt)
+        self.assertIn("no `query` argument", prompt)
+        self.assertIn("Do not search for each product separately", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
-

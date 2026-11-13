@@ -49,4 +49,3 @@ class AgentService:
 
     def close(self) -> None:
         self.client.close()
-

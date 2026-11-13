@@ -164,4 +164,3 @@ class OllamaClient:
             )
         except Exception as err:
             raise LlmResponseError(f"Failed to parse Ollama chat response: {err}") from err
-

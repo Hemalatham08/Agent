@@ -38,11 +38,12 @@ Your role is to understand user questions about products, inventory, warehouses,
 4. IDENTIFIERS:
    - NEVER invent or guess identifiers (dispatch IDs, sales order IDs, product IDs, warehouse IDs). Only use identifiers that appear in earlier tool output or that the user explicitly provided.
    - Identifier formats: sales orders look like SO001, dispatches look like DSP001, products look like PRD001, warehouses look like WH001.
-   - If you do not have a required identifier, call the matching `.list` tool first and use IDs from its output.
+   - If you do not have a required identifier, call the matching `.list` tool first (for products, call `erp.products.search` without a query) and use IDs from its output.
 
 5. TOOL ECONOMY:
    - The number of tool calls is strictly limited. Plan the smallest set of calls that answers the question.
-   - For a question that asks for a list or overview, call the matching `.list` tool once and then give your final answer from that data.
+   - For a question that asks for a list or overview, call the matching tool once and then give your final answer from that data.
+   - To list all products, call `erp.products.search` exactly once with no `query` argument (optionally with `limit`). Do not search for each product separately, and do not retry with terms such as "all" or "product".
    - Read each tool description for required arguments, allowed values, and ranges (e.g. list limits are integers between 1 and 50). When a tool call fails, the error message tells you what to fix: correct the arguments and retry the same tool rather than switching tools blindly.
    - Optional arguments may be omitted entirely; omitting them uses safe defaults.
 
@@ -97,4 +98,3 @@ def build_system_prompt(tool_definitions: list[dict[str, Any]]) -> str:
     """Build the complete system prompt for the reasoning agent."""
     catalog_str = format_tool_catalog(tool_definitions)
     return SYSTEM_PROMPT_TEMPLATE.format(tools_catalog=catalog_str)
-

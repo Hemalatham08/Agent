@@ -22,6 +22,10 @@ class ProductDetail(ProductSummary):
     reorder_level: int = Field(ge=0)
 
 
+class ProductCountResult(ErpModel):
+    product_count: int = Field(ge=0)
+
+
 class InventoryRow(ErpModel):
     product_id: str
     product_name: str
@@ -138,6 +142,7 @@ __all__ = [
     "LowStockResult",
     "LowStockRow",
     "ProductDetail",
+    "ProductCountResult",
     "ProductSearchResult",
     "ProductSummary",
     "SalesOrderDetail",

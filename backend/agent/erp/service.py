@@ -23,6 +23,7 @@ from backend.agent.erp.models import (
     LowStockResult,
     LowStockRow,
     ProductDetail,
+    ProductCountResult,
     ProductSearchResult,
     ProductSummary,
     SalesOrderDetail,
@@ -51,6 +52,11 @@ WHERE product_id = ?
 LIMIT 1
 """
 
+_PRODUCT_COUNT_SQL = """
+SELECT COUNT(*) AS product_count
+FROM products
+"""
+
 _WAREHOUSE_EXISTS_SQL = """
 SELECT 1 AS found
 FROM warehouses
@@ -74,6 +80,21 @@ WHERE product_name LIKE ? ESCAPE '\'
    OR material LIKE ? ESCAPE '\'
    OR size LIKE ? ESCAPE '\'
    OR grade LIKE ? ESCAPE '\'
+ORDER BY product_name COLLATE NOCASE ASC, product_id ASC
+LIMIT ?
+"""
+
+_PRODUCT_LIST_SQL = """
+SELECT
+    product_id,
+    sku,
+    product_name,
+    category,
+    material,
+    size,
+    grade,
+    unit
+FROM products
 ORDER BY product_name COLLATE NOCASE ASC, product_id ASC
 LIMIT ?
 """
@@ -417,6 +438,34 @@ class ErpReadService:
             truncated=len(rows) > normalized_limit,
         )
 
+    def list_products(
+        self,
+        limit: int = _DEFAULT_SEARCH_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ProductSearchResult:
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            _MAX_LIST_LIMIT,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        rows = self._fetch_all(
+            _PRODUCT_LIST_SQL,
+            (normalized_limit + 1,),
+            deadline,
+        )
+        items = [
+            self._map_product_summary(row)
+            for row in rows[:normalized_limit]
+        ]
+        return ProductSearchResult(
+            items=items,
+            row_count=len(items),
+            truncated=len(rows) > normalized_limit,
+        )
+
     def get_product(
         self,
         product_id: str,
@@ -437,6 +486,21 @@ class ErpReadService:
         if row is None:
             raise ErpNotFoundError("product")
         return self._map_product_detail(row)
+
+    def count_products(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ProductCountResult:
+        deadline = self._deadline(timeout_seconds)
+        row = self._fetch_one(_PRODUCT_COUNT_SQL, (), deadline)
+        if row is None:
+            raise ErpInternalError()
+        return self._map_model(
+            ProductCountResult,
+            row,
+            ("product_count",),
+        )
 
     def get_inventory(
         self,

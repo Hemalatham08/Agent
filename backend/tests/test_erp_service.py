@@ -115,6 +115,52 @@ class ErpReadServiceTests(unittest.TestCase):
                 with self.assertRaises(ErpInvalidArgumentsError):
                     self.service.search_products("M10", limit)
 
+    def test_list_products_returns_all_ordered(self) -> None:
+        result = self.service.list_products()
+
+        self.assertEqual(
+            [item.product_id for item in result.items],
+            ["PRD003", "PRD005", "PRD001", "PRD002", "PRD004"],
+        )
+        self.assertEqual(result.row_count, 5)
+        self.assertFalse(result.truncated)
+
+    def test_list_products_returns_all_six_when_present(self) -> None:
+        self._execute(
+            "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "PRD006",
+                "HEX-M12-SS316",
+                "Hex Bolt M12",
+                "Bolts",
+                "Stainless Steel",
+                "M12",
+                "SS316",
+                "pieces",
+                9.0,
+                14.0,
+                300,
+            ),
+        )
+
+        result = self.service.list_products()
+
+        self.assertEqual(result.row_count, 6)
+        self.assertIn("PRD006", [item.product_id for item in result.items])
+        self.assertFalse(result.truncated)
+
+    def test_list_products_applies_limit_and_truncation(self) -> None:
+        result = self.service.list_products(2)
+
+        self.assertEqual(result.row_count, 2)
+        self.assertTrue(result.truncated)
+
+    def test_list_products_rejects_invalid_limits(self) -> None:
+        for limit in (0, 51, True, "20", None):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ErpInvalidArgumentsError):
+                    self.service.list_products(limit)
+
     def test_product_detail_returns_allowed_fields_only(self) -> None:
         product = self.service.get_product("PRD001")
 

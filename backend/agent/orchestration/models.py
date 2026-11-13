@@ -27,4 +27,3 @@ class AgentExecutionResult(BaseModel):
     error: str | None = None
     iterations: int = 0
     session_id: str | None = None
-

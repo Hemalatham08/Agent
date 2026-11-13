@@ -11,7 +11,9 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         name="erp.products.search",
         description=(
-            "Find products by name, SKU, material, size, or grade."
+            "Find products by name, SKU, material, size, or grade. Omit the "
+            "query argument (or leave it blank) to list all products in one "
+            "call, optionally bounded by limit (1-50, default 20)."
         ),
         input_schema={
             "type": "object",
@@ -19,7 +21,6 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
             },
-            "required": ["query"],
             "additionalProperties": False,
         },
         version=_ERP_TOOL_VERSION,
@@ -34,6 +35,17 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
                 "product_id": {"type": "string"},
             },
             "required": ["product_id"],
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
+        name="erp.products.count",
+        description="Return the authoritative total number of products.",
+        input_schema={
+            "type": "object",
+            "properties": {},
             "additionalProperties": False,
         },
         version=_ERP_TOOL_VERSION,

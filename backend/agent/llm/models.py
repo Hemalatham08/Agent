@@ -49,4 +49,3 @@ class ToolSelectionDecision(BaseModel):
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
     final_answer: str | None = None
-

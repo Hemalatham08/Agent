@@ -41,6 +41,153 @@ _DELIVERY_SEMANTICS_NOTE = (
     "tracked in this ERP."
 )
 _MAX_FALLBACK_OUTPUT_CHARS = 1200
+_PRODUCT_COUNT_TOOL = "erp.products.count"
+_UNSUPPORTED_ERP_TERMS = (
+    "create",
+    "delete",
+    "update",
+    "adjust",
+    "purchase order",
+    "supplier",
+    "quality",
+    "inspection",
+    "invoice",
+    "payment",
+    "outstanding",
+    "accounting",
+    "price",
+    "revenue",
+)
+
+
+def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
+    """Return the approved tool family required for a known ERP question.
+
+    ``None`` represents a non-factual request, such as a greeting. An empty
+    tuple represents an ERP domain that has no approved read-only tool.
+    """
+
+    text = question.lower()
+    if any(term in text for term in _UNSUPPORTED_ERP_TERMS):
+        return ()
+    if any(term in text for term in ("inventory", "stock", "warehouse")):
+        return ("erp.inventory.", "erp.warehouses.")
+    if "sales order" in text:
+        return ("erp.sales_orders.",)
+    if any(term in text for term in ("dispatch", "shipment", "delivered")):
+        return ("erp.dispatches.",)
+    if "product" in text or "sku" in text:
+        if any(
+            phrase in text
+            for phrase in ("how many", "count", "number of", "total products")
+        ):
+            return (_PRODUCT_COUNT_TOOL,)
+        return ("erp.products.",)
+    return None
+
+
+def _tool_matches(expected: str, tool_name: str) -> bool:
+    """Return whether a tool result belongs to an approved evidence family.
+
+    The product count tool is exact-match only, so a successful count can
+    never be used as evidence for product detail or product listing answers.
+    """
+
+    if expected == _PRODUCT_COUNT_TOOL:
+        return tool_name == expected
+    if tool_name == _PRODUCT_COUNT_TOOL:
+        return False
+    return tool_name.startswith(expected)
+
+
+def _has_required_evidence(
+    requirement: tuple[str, ...],
+    outputs: list[tuple[str, Any]],
+) -> bool:
+    return any(
+        isinstance(output, Mapping)
+        and any(_tool_matches(expected, tool_name) for expected in requirement)
+        for tool_name, output in outputs
+    )
+
+
+def _authoritative_product_count(
+    outputs: list[tuple[str, Any]],
+) -> int | None:
+    for tool_name, output in outputs:
+        if tool_name != _PRODUCT_COUNT_TOOL or not isinstance(output, Mapping):
+            continue
+        count = output.get("product_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            return count
+    return None
+
+
+def _grounding_failure_answer(
+    requirement: tuple[str, ...],
+    summaries: list[ToolCallSummary],
+) -> tuple[str, str]:
+    if not requirement:
+        return (
+            "I cannot provide a verified answer for that ERP domain because no "
+            "approved read-only tool is available.",
+            "unsupported_capability",
+        )
+
+    relevant_failures = [
+        summary
+        for summary in summaries
+        if any(_tool_matches(expected, summary.tool_name) for expected in requirement)
+        and summary.status != ToolExecutionStatus.SUCCEEDED.value
+    ]
+    if relevant_failures:
+        failure = relevant_failures[-1]
+        detail = f" The tool reported: {failure.error}." if failure.error else ""
+        return (
+            "I could not retrieve verified ERP data for this question, so I "
+            f"cannot provide an authoritative answer.{detail}",
+            "tool_evidence_failed",
+        )
+
+    return (
+        "I cannot provide a verified ERP answer because no successful relevant "
+        "tool result was retrieved.",
+        "missing_tool_evidence",
+    )
+
+
+def _grounded_answer(
+    requirement: tuple[str, ...] | None,
+    answer_text: str,
+    successful_outputs: list[tuple[str, Any]],
+    summaries: list[ToolCallSummary],
+) -> tuple[str, str, str | None]:
+    """Apply the milestone grounding rules to a candidate final answer.
+
+    Returns ``(answer, status, error)``. Product counts are always replaced
+    with the value returned by the registered count tool, never with text
+    proposed by the language model.
+    """
+
+    if requirement is None:
+        return answer_text, "completed", None
+
+    if not _has_required_evidence(requirement, successful_outputs):
+        answer, error = _grounding_failure_answer(requirement, summaries)
+        return answer, "error", error
+
+    if requirement == (_PRODUCT_COUNT_TOOL,):
+        product_count = _authoritative_product_count(successful_outputs)
+        if product_count is None:
+            return (
+                "I could not retrieve a valid authoritative product count, "
+                "so I cannot provide a verified answer.",
+                "error",
+                "invalid_tool_evidence",
+            )
+        return f"There are {product_count} products in the ERP.", "completed", None
+
+    return answer_text, "completed", None
 
 
 def _clean_json_text(text: str) -> str:
@@ -231,6 +378,8 @@ class AgentOrchestrator:
                 session_id=session_id,
             )
 
+        grounding_requirement = _required_tool_evidence(stripped_question)
+
         # 1. Health & model availability check
         try:
             self.client.validate_availability()
@@ -330,10 +479,18 @@ class AgentOrchestrator:
                 answer_text = (decision.final_answer or "").strip()
                 if not answer_text:
                     answer_text = "I have processed your request, but no additional explanation was generated."
+
+                answer_text, status, error = _grounded_answer(
+                    grounding_requirement,
+                    answer_text,
+                    successful_outputs,
+                    executed_summaries,
+                )
                 return AgentExecutionResult(
                     answer=answer_text,
                     tool_calls=executed_summaries,
-                    status="completed",
+                    status=status,
+                    error=error,
                     iterations=iteration,
                     session_id=session_id,
                 )
@@ -448,6 +605,7 @@ class AgentOrchestrator:
             executed_summaries,
             successful_outputs,
             iteration,
+            grounding_requirement=grounding_requirement,
             session_id=session_id,
         )
 
@@ -458,13 +616,16 @@ class AgentOrchestrator:
         successful_outputs: list[tuple[str, Any]],
         iteration: int,
         *,
+        grounding_requirement: tuple[str, ...] | None,
         session_id: str | None,
     ) -> AgentExecutionResult:
         """Compose a final answer after the loop budget was exhausted.
 
         The model gets one last chance to answer. If it fails, previously
         retrieved data is preserved in a deterministic summary so partial
-        failures never invalidate successful tool results.
+        failures never invalidate successful tool results. Grounding rules
+        are applied to synthesized answers exactly as they are to normal
+        final answers.
         """
 
         reminder = (
@@ -491,10 +652,52 @@ class AgentOrchestrator:
             final_text = ""
 
         if final_text:
+            answer, status, error = _grounded_answer(
+                grounding_requirement,
+                final_text,
+                successful_outputs,
+                executed_summaries,
+            )
             return AgentExecutionResult(
-                answer=final_text,
+                answer=answer,
                 tool_calls=executed_summaries,
-                status="completed",
+                status=status,
+                error=error,
+                iterations=iteration,
+                session_id=session_id,
+            )
+
+        if grounding_requirement == (_PRODUCT_COUNT_TOOL,):
+            answer, status, error = _grounded_answer(
+                grounding_requirement,
+                "",
+                successful_outputs,
+                executed_summaries,
+            )
+            return AgentExecutionResult(
+                answer=answer,
+                tool_calls=executed_summaries,
+                status=status,
+                error=error,
+                iterations=iteration,
+                session_id=session_id,
+            )
+
+        if grounding_requirement is not None and not _has_required_evidence(
+            grounding_requirement,
+            successful_outputs,
+        ):
+            answer, status, error = _grounded_answer(
+                grounding_requirement,
+                "",
+                successful_outputs,
+                executed_summaries,
+            )
+            return AgentExecutionResult(
+                answer=answer,
+                tool_calls=executed_summaries,
+                status=status,
+                error=error,
                 iterations=iteration,
                 session_id=session_id,
             )
@@ -538,4 +741,3 @@ class AgentOrchestrator:
         if _used_dispatch_tools(executed_summaries):
             lines.append(_DELIVERY_SEMANTICS_NOTE)
         return "\n".join(lines)
-

@@ -25,6 +25,7 @@ from backend.tests.erp_support import create_erp_fixture_db
 _EXPECTED_TOOL_NAMES = (
     "erp.products.search",
     "erp.products.get",
+    "erp.products.count",
     "erp.inventory.get",
     "erp.warehouses.list",
     "erp.inventory.low_stock",
@@ -77,8 +78,9 @@ class ErpToolDefinitionTests(unittest.TestCase):
 
     def test_schemas_are_strict_objects(self) -> None:
         expected_required = {
-            "erp.products.search": {"query"},
+            "erp.products.search": set(),
             "erp.products.get": {"product_id"},
+            "erp.products.count": set(),
             "erp.inventory.get": {"product_id"},
             "erp.warehouses.list": set(),
             "erp.inventory.low_stock": set(),
@@ -239,6 +241,31 @@ class ErpToolHandlerTests(unittest.TestCase):
         self.assertNotIn("purchase_price", envelope["data"]["items"][0])
         self.assertNotIn("selling_price", envelope["data"]["items"][0])
 
+    def test_search_without_query_lists_all_products(self) -> None:
+        envelope = self._invoke("erp.products.search", {})
+
+        self.assertIs(envelope["ok"], True)
+        self.assertEqual(
+            [item["product_id"] for item in envelope["data"]["items"]],
+            ["PRD003", "PRD005", "PRD001", "PRD002", "PRD004"],
+        )
+        self.assertEqual(envelope["data"]["row_count"], 5)
+        self.assertIs(envelope["data"]["truncated"], False)
+
+    def test_search_blank_query_lists_all_products(self) -> None:
+        envelope = self._invoke("erp.products.search", {"query": "   "})
+
+        self.assertIs(envelope["ok"], True)
+        self.assertEqual(envelope["data"]["row_count"], 5)
+        self.assertIs(envelope["data"]["truncated"], False)
+
+    def test_search_without_query_applies_limit(self) -> None:
+        envelope = self._invoke("erp.products.search", {"limit": 2})
+
+        self.assertIs(envelope["ok"], True)
+        self.assertEqual(envelope["data"]["row_count"], 2)
+        self.assertIs(envelope["data"]["truncated"], True)
+
     def test_product_detail_success_envelope(self) -> None:
         envelope = self._invoke(
             "erp.products.get",
@@ -248,6 +275,12 @@ class ErpToolHandlerTests(unittest.TestCase):
         self.assertIs(envelope["ok"], True)
         self.assertEqual(envelope["data"]["product_id"], "PRD001")
         self.assertEqual(envelope["data"]["reorder_level"], 500)
+
+    def test_product_count_success_envelope(self) -> None:
+        envelope = self._invoke("erp.products.count", {})
+
+        self.assertIs(envelope["ok"], True)
+        self.assertEqual(envelope["data"], {"product_count": 5})
 
     def test_inventory_success_envelope(self) -> None:
         envelope = self._invoke(
@@ -431,11 +464,10 @@ class ErpToolHandlerTests(unittest.TestCase):
 
     def test_invalid_arguments_are_rejected(self) -> None:
         cases = (
-            ("erp.products.search", {}),
-            ("erp.products.search", {"query": "   "}),
-            ("erp.products.search", {"query": "M10", "limit": 0}),
-            ("erp.products.search", {"query": "M10", "limit": 51}),
-            ("erp.products.search", {"query": "M10", "limit": True}),
+            ("erp.products.search", {"query": 123}),
+            ("erp.products.search", {"limit": 0}),
+            ("erp.products.search", {"limit": 51}),
+            ("erp.products.search", {"limit": True}),
             ("erp.products.get", {"product_id": ""}),
             ("erp.inventory.get", {"product_id": "PRD001", "limit": 1}),
             ("erp.warehouses.list", {"limit": 1}),
@@ -496,6 +528,7 @@ class ErpToolHandlerTests(unittest.TestCase):
         for tool_name, arguments in (
             ("erp.products.search", {"query": "M10"}),
             ("erp.products.get", {"product_id": "PRD001"}),
+            ("erp.products.count", {}),
             ("erp.inventory.get", {"product_id": "PRD001"}),
             ("erp.warehouses.list", {}),
             ("erp.inventory.low_stock", {}),

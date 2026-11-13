@@ -672,7 +672,8 @@ class DispatchScenarioOrchestratorTests(_ScriptedOllamaHarness):
 
     def test_llm_round_cap_ends_in_synthesized_answer(self) -> None:
         # Scenario 12 (round cap): unparseable model output never loops
-        # forever; the synthesis round still produces an answer.
+        # forever; the synthesis round still produces an answer. A greeting
+        # keeps this focused on the round cap rather than ERP grounding.
         orchestrator = self._create_orchestrator(
             [
                 "not json",
@@ -681,16 +682,16 @@ class DispatchScenarioOrchestratorTests(_ScriptedOllamaHarness):
                 {
                     "thought": "Answer despite unparseable rounds",
                     "action": "final_answer",
-                    "final_answer": "No dispatch data was retrieved.",
+                    "final_answer": "Hello! How can I help?",
                 },
             ],
             max_tool_calls=1,
         )
-        res = orchestrator.process_question("List dispatches")
+        res = orchestrator.process_question("Hello")
         self.assertEqual(res.iterations, 3)
         self.assertEqual(res.tool_calls, [])
         self.assertEqual(res.status, "completed")
-        self.assertEqual(res.answer, "No dispatch data was retrieved.")
+        self.assertEqual(res.answer, "Hello! How can I help?")
 
     def test_unknown_action_produces_corrective_feedback(self) -> None:
         orchestrator = self._create_orchestrator(
@@ -707,7 +708,8 @@ class DispatchScenarioOrchestratorTests(_ScriptedOllamaHarness):
             ]
         )
         res = orchestrator.process_question("List dispatches")
-        self.assertEqual(res.status, "completed")
+        self.assertEqual(res.status, "error")
+        self.assertEqual(res.error, "missing_tool_evidence")
         feedback_text = "\n".join(
             m["content"] for m in self.chat_requests[1]["messages"]
         )

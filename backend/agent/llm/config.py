@@ -77,4 +77,3 @@ class LlmConfig:
             timeout_seconds=timeout,
             max_tool_calls=max_calls,
         )
-

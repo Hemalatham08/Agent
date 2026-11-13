@@ -92,6 +92,7 @@ class ErpToolRunnerSuccessTests(unittest.TestCase):
         cases = (
             ("erp.products.search", {"query": "M10"}),
             ("erp.products.get", {"product_id": "PRD001"}),
+            ("erp.products.count", {}),
             ("erp.inventory.get", {"product_id": "PRD001"}),
             ("erp.warehouses.list", {}),
             ("erp.inventory.low_stock", {"limit": 10}),
@@ -173,7 +174,7 @@ class ErpToolRunnerErrorTests(unittest.TestCase):
         result = self.runner.execute(
             ToolExecutionRequest(
                 tool_name="erp.products.search",
-                arguments={"query": "   "},
+                arguments={"query": "M10", "limit": 0},
             )
         )
 

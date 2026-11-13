@@ -11,4 +11,3 @@ __all__ = [
     "build_system_prompt",
     "format_tool_catalog",
 ]
-

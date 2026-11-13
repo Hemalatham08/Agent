@@ -42,6 +42,7 @@ class ErpToolHandlers:
         return {
             "erp.products.search": self.search_products,
             "erp.products.get": self.get_product,
+            "erp.products.count": self.count_products,
             "erp.inventory.get": self.get_inventory,
             "erp.warehouses.list": self.list_warehouses,
             "erp.inventory.low_stock": self.list_low_stock,
@@ -56,14 +57,27 @@ class ErpToolHandlers:
         arguments: dict[str, JsonValue],
         context: ToolExecutionContext,
     ) -> dict[str, JsonValue]:
+        def operation(args: Mapping[str, JsonValue]) -> Any:
+            limit = args.get("limit", 20)
+            query = args.get("query")
+            if isinstance(query, str):
+                query = query.strip()
+
+            if not query:
+                return self._service.list_products(
+                    limit,
+                    timeout_seconds=context.timeout_seconds,
+                )
+            return self._service.search_products(
+                query,
+                limit,
+                timeout_seconds=context.timeout_seconds,
+            )
+
         return self._handle(
             "erp.products.search",
             arguments,
-            lambda args: self._service.search_products(
-                args["query"],
-                args.get("limit", 20),
-                timeout_seconds=context.timeout_seconds,
-            ),
+            operation,
         )
 
     def get_product(
@@ -76,6 +90,19 @@ class ErpToolHandlers:
             arguments,
             lambda args: self._service.get_product(
                 args["product_id"],
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def count_products(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.products.count",
+            arguments,
+            lambda _args: self._service.count_products(
                 timeout_seconds=context.timeout_seconds,
             ),
         )
