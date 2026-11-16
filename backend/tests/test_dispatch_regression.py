@@ -273,7 +273,7 @@ class _ScriptedOllamaHarness(unittest.TestCase):
 
     def _create_orchestrator(
         self,
-        responses: list[dict[str, Any] | str],
+        responses: list[dict[str, Any] | str | Exception | httpx.Response],
         *,
         max_tool_calls: int = 5,
     ) -> AgentOrchestrator:
@@ -293,6 +293,10 @@ class _ScriptedOllamaHarness(unittest.TestCase):
                         "action": "final_answer",
                         "final_answer": "No further information.",
                     }
+                if isinstance(resp_data, Exception):
+                    raise resp_data
+                if isinstance(resp_data, httpx.Response):
+                    return resp_data
                 if isinstance(resp_data, str):
                     content = resp_data
                 else:
@@ -598,6 +602,26 @@ class DispatchScenarioOrchestratorTests(_ScriptedOllamaHarness):
         self.assertIn("DSP001", res.answer)
         self.assertIn("DSP002", res.answer)
         # Dispatch vs confirmed delivery is still distinguished.
+        self.assertIn("confirmed customer delivery", res.answer)
+
+    def test_llm_timeout_preserves_dispatch_data_and_delivery_note(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List all dispatches",
+                    "action": "call_tool",
+                    "tool_name": "erp.dispatches.list",
+                    "arguments": {},
+                },
+                httpx.ReadTimeout("timed out"),
+            ]
+        )
+        res = orchestrator.process_question("Give me the list of elements that are delivered")
+        self.assertEqual(res.status, "incomplete")
+        self.assertEqual(res.error, "llm_timeout")
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+        self.assertIn("DSP001", res.answer)
+        self.assertIn("DSP002", res.answer)
         self.assertIn("confirmed customer delivery", res.answer)
 
     def test_budget_counts_executions_not_validation_failures(self) -> None:

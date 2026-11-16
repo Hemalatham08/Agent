@@ -110,6 +110,26 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         metadata=dict(_ERP_READ_ONLY_METADATA),
     ),
     ToolDefinition(
+        name="erp.sales_orders.search",
+        description=(
+            "Find sales orders by customer name, customer ID, or order status "
+            "(such as Pending, Partially Dispatched, Dispatched). Omit all arguments "
+            "(or leave query blank) to list recent sales orders, optionally bounded "
+            "by limit (1-50, default 20)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
         name="erp.dispatches.get",
         description=(
             "Retrieve one dispatch record (header plus picked/dispatched items) by its "

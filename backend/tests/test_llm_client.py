@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import patch
 import httpx
 
 from backend.agent.llm.client import OllamaClient
@@ -17,7 +19,7 @@ from backend.agent.llm.models import ChatMessage, ChatRole
 class TestLlmConfig(unittest.TestCase):
     def test_default_config(self) -> None:
         cfg = LlmConfig()
-        self.assertEqual(cfg.base_url, "http://localhost:11434")
+        self.assertEqual(cfg.base_url, "http://127.0.0.1:11434")
         self.assertEqual(cfg.model, "llama3.2")
         self.assertEqual(cfg.timeout_seconds, 30.0)
         self.assertEqual(cfg.max_tool_calls, 5)
@@ -40,6 +42,12 @@ class TestLlmConfig(unittest.TestCase):
 
 
 class TestOllamaClient(unittest.TestCase):
+    def _logged_metrics(self, captured) -> dict[str, object]:
+        message = captured.records[-1].getMessage()
+        event, payload = message.split(" ", 1)
+        self.assertEqual(event, "ollama_chat")
+        return json.loads(payload)
+
     def test_health_check_success(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.path, "/api/tags")
@@ -125,6 +133,225 @@ class TestOllamaClient(unittest.TestCase):
         self.assertEqual(resp.model, "llama3.2")
         self.assertAlmostEqual(resp.duration_ms, 150.0)
         self.assertEqual(resp.eval_count, 12)
+
+    def test_chat_records_all_timing_and_token_metadata(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/api/chat")
+            body = json.loads(request.content)
+            self.assertFalse(body["stream"])
+            self.assertNotIn("num_predict", body.get("options", {}))
+            return httpx.Response(
+                200,
+                json={
+                    "model": "llama3.2:latest",
+                    "message": {"role": "assistant", "content": "hello"},
+                    "done": True,
+                    "done_reason": "stop",
+                    "total_duration": 2_000_000_000,
+                    "load_duration": 200_000_000,
+                    "prompt_eval_count": 100,
+                    "prompt_eval_duration": 300_000_000,
+                    "eval_count": 50,
+                    "eval_duration": 1_400_000_000,
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=250.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                resp = llm.chat(
+                    [ChatMessage(role=ChatRole.USER, content="SECRET_CUSTOMER_DATA")]
+                )
+
+        self.assertEqual(resp.duration_ms, 2000.0)
+        self.assertEqual(resp.request_duration_ms, 250.0)
+        self.assertEqual(resp.total_duration_ns, 2_000_000_000)
+        self.assertEqual(resp.load_duration_ns, 200_000_000)
+        self.assertEqual(resp.prompt_eval_count, 100)
+        self.assertEqual(resp.prompt_eval_duration_ns, 300_000_000)
+        self.assertEqual(resp.eval_count, 50)
+        self.assertEqual(resp.eval_duration_ns, 1_400_000_000)
+        self.assertEqual(resp.done_reason, "stop")
+        self.assertFalse(resp.truncated)
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "completed")
+        self.assertEqual(metrics["model"], "llama3.2:latest")
+        self.assertEqual(metrics["request_ms"], 250.0)
+        self.assertEqual(metrics["total_ms"], 2000.0)
+        self.assertEqual(metrics["load_ms"], 200.0)
+        self.assertEqual(metrics["prompt_eval_count"], 100)
+        self.assertEqual(metrics["prompt_eval_ms"], 300.0)
+        self.assertEqual(metrics["eval_count"], 50)
+        self.assertEqual(metrics["eval_ms"], 1400.0)
+        self.assertEqual(metrics["done_reason"], "stop")
+        self.assertFalse(metrics["truncated"])
+        self.assertFalse(metrics["failed"])
+        self.assertIsNone(metrics["error_type"])
+        self.assertEqual(metrics["status_code"], 200)
+        self.assertNotIn("SECRET_CUSTOMER_DATA", captured.records[-1].getMessage())
+
+    def test_chat_missing_optional_metadata_does_not_fail(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "llama3.2",
+                    "message": {"role": "assistant", "content": "hello"},
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=130.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                resp = llm.chat([ChatMessage(role=ChatRole.USER, content="Hello")])
+
+        self.assertIsNone(resp.duration_ms)
+        self.assertEqual(resp.request_duration_ms, 130.0)
+        self.assertIsNone(resp.total_duration_ns)
+        self.assertIsNone(resp.load_duration_ns)
+        self.assertIsNone(resp.prompt_eval_count)
+        self.assertIsNone(resp.prompt_eval_duration_ns)
+        self.assertIsNone(resp.eval_count)
+        self.assertIsNone(resp.eval_duration_ns)
+        self.assertIsNone(resp.done_reason)
+        self.assertFalse(resp.truncated)
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "completed")
+        self.assertEqual(metrics["request_ms"], 130.0)
+        self.assertIsNone(metrics["total_ms"])
+        self.assertIsNone(metrics["load_ms"])
+        self.assertIsNone(metrics["prompt_eval_count"])
+        self.assertIsNone(metrics["eval_count"])
+        self.assertIsNone(metrics["done_reason"])
+        self.assertFalse(metrics["truncated"])
+        self.assertFalse(metrics["failed"])
+
+    def test_chat_records_truncation_from_done_reason_length(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "llama3.2",
+                    "message": {"role": "assistant", "content": '{"partial":'},
+                    "done_reason": "length",
+                    "total_duration": 500_000_000,
+                    "eval_count": 256,
+                    "eval_duration": 400_000_000,
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=500.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                resp = llm.chat([ChatMessage(role=ChatRole.USER, content="Hello")])
+
+        self.assertEqual(resp.content, '{"partial":')
+        self.assertEqual(resp.done_reason, "length")
+        self.assertTrue(resp.truncated)
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "truncated")
+        self.assertEqual(metrics["done_reason"], "length")
+        self.assertTrue(metrics["truncated"])
+        self.assertFalse(metrics["failed"])
+        self.assertEqual(metrics["status_code"], 200)
+
+    def test_chat_timeout_is_instrumented(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException("Timed out")
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(timeout_seconds=5.0), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=250.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                with self.assertRaises(LlmTimeoutError):
+                    llm.chat(
+                        [ChatMessage(role=ChatRole.USER, content="SECRET_CUSTOMER_DATA")]
+                    )
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "timeout")
+        self.assertEqual(metrics["model"], "llama3.2")
+        self.assertEqual(metrics["request_ms"], 250.0)
+        self.assertTrue(metrics["failed"])
+        self.assertEqual(metrics["error_type"], "LlmTimeoutError")
+        self.assertIsNone(metrics["status_code"])
+        self.assertIsNone(metrics["done_reason"])
+        self.assertIsNone(metrics["truncated"])
+        self.assertNotIn("SECRET_CUSTOMER_DATA", captured.records[-1].getMessage())
+
+    def test_chat_http_error_is_instrumented(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="Internal crash")
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=250.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                with self.assertRaises(LlmResponseError):
+                    llm.chat([ChatMessage(role=ChatRole.USER, content="Hello")])
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "error")
+        self.assertEqual(metrics["model"], "llama3.2")
+        self.assertEqual(metrics["request_ms"], 250.0)
+        self.assertTrue(metrics["failed"])
+        self.assertEqual(metrics["error_type"], "LlmResponseError")
+        self.assertEqual(metrics["status_code"], 500)
+
+    def test_chat_connection_error_is_instrumented(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("Connection refused")
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        llm = OllamaClient(LlmConfig(), http_client=client)
+
+        with patch(
+            "backend.agent.llm.client._elapsed_ms",
+            return_value=250.0,
+        ):
+            with self.assertLogs("backend.agent.llm.client", level="INFO") as captured:
+                with self.assertRaises(LlmConnectionError):
+                    llm.chat([ChatMessage(role=ChatRole.USER, content="Hello")])
+
+        metrics = self._logged_metrics(captured)
+        self.assertEqual(metrics["outcome"], "error")
+        self.assertEqual(metrics["model"], "llama3.2")
+        self.assertEqual(metrics["request_ms"], 250.0)
+        self.assertTrue(metrics["failed"])
+        self.assertEqual(metrics["error_type"], "LlmConnectionError")
+        self.assertIsNone(metrics["status_code"])
 
     def test_chat_connection_error(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
