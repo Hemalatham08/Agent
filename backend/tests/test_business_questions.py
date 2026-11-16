@@ -411,5 +411,60 @@ class TestProductPromptSemantics(unittest.TestCase):
         self.assertIn("Do not search for each product separately", prompt)
 
 
+class TestSalesOrderSearchAndPendingOrders(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "fixture_erp.db"
+        create_erp_fixture_db(self.db_path)
+
+        self.erp_config = ErpDatabaseConfig(self.db_path, query_timeout_seconds=5.0)
+        self.adapter = SqliteErpReadAdapter(self.erp_config)
+        self.service = ErpReadService(self.adapter)
+
+        self.registry = ToolRegistry()
+        self.executor = ToolExecutor(self.registry)
+        self.registration = register_erp_tools(self.registry, self.executor, self.service)
+        self.runner = ErpToolRunner(self.executor)
+
+    def tearDown(self) -> None:
+        self.registration.unregister()
+        self.executor.shutdown(wait=True)
+        self.temp_dir.cleanup()
+
+    def test_search_sales_orders_by_exact_customer_name(self) -> None:
+        res = self.service.search_sales_orders(query="Sri Venkateswara Engineering")
+        self.assertEqual(res.row_count, 1)
+        self.assertEqual(res.items[0].order.so_id, "SO001")
+        self.assertEqual(res.items[0].order.customer_name, "Sri Venkateswara Engineering")
+
+    def test_search_sales_orders_by_partial_customer_name(self) -> None:
+        res = self.service.search_sales_orders(query="Venkateswara")
+        self.assertEqual(res.row_count, 1)
+        self.assertEqual(res.items[0].order.so_id, "SO001")
+
+    def test_filter_pending_orders(self) -> None:
+        res = self.service.search_sales_orders(status="Pending")
+        self.assertEqual(res.row_count, 1)
+        self.assertEqual(res.items[0].order.so_id, "SO002")
+        self.assertEqual(res.items[0].order.status, "Pending")
+
+    def test_filter_partially_dispatched_orders(self) -> None:
+        res = self.service.search_sales_orders(status="Partially Dispatched")
+        self.assertEqual(res.row_count, 1)
+        self.assertEqual(res.items[0].order.so_id, "SO001")
+        self.assertEqual(res.items[0].order.status, "Partially Dispatched")
+
+    def test_customer_with_no_matching_orders(self) -> None:
+        res = self.service.search_sales_orders(query="Nonexistent Customer")
+        self.assertEqual(res.row_count, 0)
+        self.assertEqual(res.items, [])
+
+    def test_system_prompt_exposes_sales_order_search(self) -> None:
+        prompt = build_system_prompt(
+            [d.model_dump() for d in ERP_TOOL_DEFINITIONS]
+        )
+        self.assertIn("erp.sales_orders.search", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

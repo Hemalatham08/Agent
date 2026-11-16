@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "llama3.2"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_TOOL_CALLS = 5

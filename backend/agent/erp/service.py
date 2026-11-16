@@ -30,6 +30,7 @@ from backend.agent.erp.models import (
     SalesOrderDispatchesResult,
     SalesOrderHeader,
     SalesOrderItem,
+    SalesOrderSearchResult,
     WarehouseListResult,
     WarehouseSummary,
 )
@@ -200,6 +201,21 @@ JOIN warehouses AS w ON w.warehouse_id = i.warehouse_id
 WHERE (i.on_hand_qty - i.reserved_qty) <= p.reorder_level
   AND i.warehouse_id = ?
 ORDER BY p.product_id ASC, i.warehouse_id ASC
+LIMIT ?
+"""
+
+_SALES_ORDER_SEARCH_SQL = """
+SELECT
+    so.so_id,
+    so.customer_id,
+    c.customer_name,
+    so.order_date,
+    so.required_date,
+    so.status
+FROM sales_orders AS so
+JOIN customers AS c ON c.customer_id = so.customer_id
+{where}
+ORDER BY so.order_date DESC, so.so_id ASC
 LIMIT ?
 """
 
@@ -645,6 +661,70 @@ class ErpReadService:
             items=items,
             items_row_count=len(items),
             items_truncated=len(item_rows) > _SALES_ORDER_ITEM_LIMIT,
+        )
+
+    def search_sales_orders(
+        self,
+        query: str | None = None,
+        status: str | None = None,
+        limit: int = _DEFAULT_SEARCH_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SalesOrderSearchResult:
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            _MAX_LIST_LIMIT,
+        )
+        normalized_query = _optional_identifier(query, "query")
+        normalized_status = _optional_identifier(status, "status")
+        deadline = self._deadline(timeout_seconds)
+
+        conditions: list[str] = []
+        parameters: list[object] = []
+
+        if normalized_query is not None:
+            pattern = f"%{_escape_like(normalized_query)}%"
+            conditions.append(
+                "(c.customer_name LIKE ? ESCAPE '\\' OR c.customer_id LIKE ? ESCAPE '\\' OR so.so_id LIKE ? ESCAPE '\\')"
+            )
+            parameters.extend([pattern, pattern, pattern])
+
+        if normalized_status is not None:
+            conditions.append("so.status = ?")
+            parameters.append(normalized_status)
+
+        sql = _SALES_ORDER_SEARCH_SQL.format(
+            where=("WHERE " + " AND ".join(conditions)) if conditions else "",
+        )
+        parameters.append(normalized_limit + 1)
+
+        rows = self._fetch_all(sql, tuple(parameters), deadline)
+        items: list[SalesOrderDetail] = []
+        for row in rows[:normalized_limit]:
+            so_id = row["so_id"]
+            item_rows = self._fetch_all(
+                _SALES_ORDER_ITEMS_SQL,
+                (so_id, _SALES_ORDER_ITEM_LIMIT + 1),
+                deadline,
+            )
+            order_items = [
+                self._map_sales_order_item(i_row)
+                for i_row in item_rows[:_SALES_ORDER_ITEM_LIMIT]
+            ]
+            items.append(
+                SalesOrderDetail(
+                    order=self._map_sales_order_header(row),
+                    items=order_items,
+                    items_row_count=len(order_items),
+                    items_truncated=len(item_rows) > _SALES_ORDER_ITEM_LIMIT,
+                )
+            )
+
+        return SalesOrderSearchResult(
+            items=items,
+            row_count=len(items),
+            truncated=len(rows) > normalized_limit,
         )
 
     def get_dispatch(

@@ -42,6 +42,56 @@ _DELIVERY_SEMANTICS_NOTE = (
 )
 _MAX_FALLBACK_OUTPUT_CHARS = 1200
 _PRODUCT_COUNT_TOOL = "erp.products.count"
+_WAREHOUSE_LIST_TOOL = "erp.warehouses.list"
+_WAREHOUSE_LIST_ANALYTICAL_TERMS = (
+    "stock",
+    "inventory",
+    "low",
+    "reorder",
+    "quantity",
+    "qty",
+    "product",
+    "sku",
+    "item",
+    "sales",
+    "order",
+    "dispatch",
+    "shipment",
+    "delivery",
+    "capacity",
+    "utilization",
+    "movement",
+    "transfer",
+)
+_WAREHOUSE_LIST_PHRASES = (
+    "list warehouse",
+    "list all warehouse",
+    "list the warehouse",
+    "list available warehouse",
+    "list of warehouses",
+    "show warehouse",
+    "show all warehouse",
+    "show me warehouse",
+    "show me all warehouse",
+    "show me the warehouse",
+    "display warehouse",
+    "all warehouses",
+    "available warehouses",
+    "warehouse list",
+    "warehouses list",
+    "what warehouse",
+    "what are the warehouse",
+    "which warehouses",
+    "warehouse names",
+    "warehouse locations",
+    "warehouse cities",
+    "names of warehouses",
+    "how many warehouses",
+    "warehouses do we have",
+    "warehouses are there",
+    "warehouses exist",
+    "tell me the warehouse",
+)
 _UNSUPPORTED_ERP_TERMS = (
     "create",
     "delete",
@@ -70,6 +120,8 @@ def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
     text = question.lower()
     if any(term in text for term in _UNSUPPORTED_ERP_TERMS):
         return ()
+    if _is_warehouse_list_question(text):
+        return (_WAREHOUSE_LIST_TOOL,)
     if any(term in text for term in ("inventory", "stock", "warehouse")):
         return ("erp.inventory.", "erp.warehouses.")
     if "sales order" in text:
@@ -86,14 +138,29 @@ def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
     return None
 
 
+def _is_warehouse_list_question(text: str) -> bool:
+    """Return whether the question clearly asks for the warehouse list.
+
+    Warehouse-specific analytical questions (stock, inventory, low stock,
+    dispatch, and similar) mention warehouses but are not list requests and
+    must keep their existing tool and synthesis behavior.
+    """
+
+    if "warehouse" not in text:
+        return False
+    if any(term in text for term in _WAREHOUSE_LIST_ANALYTICAL_TERMS):
+        return False
+    return any(phrase in text for phrase in _WAREHOUSE_LIST_PHRASES)
+
+
 def _tool_matches(expected: str, tool_name: str) -> bool:
     """Return whether a tool result belongs to an approved evidence family.
 
-    The product count tool is exact-match only, so a successful count can
-    never be used as evidence for product detail or product listing answers.
+    The product count and warehouse list tools are exact-match only, so a
+    successful result can never be used as evidence for another question.
     """
 
-    if expected == _PRODUCT_COUNT_TOOL:
+    if expected in (_PRODUCT_COUNT_TOOL, _WAREHOUSE_LIST_TOOL):
         return tool_name == expected
     if tool_name == _PRODUCT_COUNT_TOOL:
         return False
@@ -121,6 +188,59 @@ def _authoritative_product_count(
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             return count
     return None
+
+
+def _authoritative_warehouse_list(
+    outputs: list[tuple[str, Any]],
+) -> str | None:
+    """Render the warehouse list from actual tool output, or ``None``.
+
+    ``None`` means no usable warehouse list output exists or the output is
+    structurally malformed. Callers must never synthesize records in that
+    case. A structurally valid empty list renders a truthful empty answer.
+    """
+
+    output = None
+    for tool_name, candidate in outputs:
+        if tool_name == _WAREHOUSE_LIST_TOOL and isinstance(candidate, Mapping):
+            output = candidate
+            break
+    if output is None:
+        return None
+
+    items = output.get("items")
+    if not isinstance(items, list):
+        return None
+
+    row_count = output.get("row_count")
+    if row_count is not None:
+        if isinstance(row_count, bool) or not isinstance(row_count, int):
+            return None
+        if row_count != len(items):
+            return None
+
+    if not items:
+        return "There are no warehouses in the ERP."
+
+    lines = [f"There are {len(items)} warehouses in the ERP:"]
+    for item in items:
+        if not isinstance(item, Mapping):
+            return None
+        warehouse_id = item.get("warehouse_id")
+        warehouse_name = item.get("warehouse_name")
+        if not isinstance(warehouse_id, str) or not warehouse_id.strip():
+            return None
+        if not isinstance(warehouse_name, str) or not warehouse_name.strip():
+            return None
+        city = item.get("city")
+        if isinstance(city, str) and city.strip():
+            lines.append(
+                f"- {warehouse_name.strip()} ({warehouse_id.strip()}) — "
+                f"{city.strip()}"
+            )
+        else:
+            lines.append(f"- {warehouse_name.strip()} ({warehouse_id.strip()})")
+    return "\n".join(lines)
 
 
 def _grounding_failure_answer(
@@ -164,9 +284,9 @@ def _grounded_answer(
 ) -> tuple[str, str, str | None]:
     """Apply the milestone grounding rules to a candidate final answer.
 
-    Returns ``(answer, status, error)``. Product counts are always replaced
-    with the value returned by the registered count tool, never with text
-    proposed by the language model.
+    Returns ``(answer, status, error)``. Product counts and warehouse lists
+    are always replaced with the value returned by the registered tool,
+    never with text proposed by the language model.
     """
 
     if requirement is None:
@@ -186,6 +306,17 @@ def _grounded_answer(
                 "invalid_tool_evidence",
             )
         return f"There are {product_count} products in the ERP.", "completed", None
+
+    if requirement == (_WAREHOUSE_LIST_TOOL,):
+        warehouse_list = _authoritative_warehouse_list(successful_outputs)
+        if warehouse_list is None:
+            return (
+                "I could not retrieve a valid authoritative warehouse list, "
+                "so I cannot provide a verified answer.",
+                "error",
+                "invalid_tool_evidence",
+            )
+        return warehouse_list, "completed", None
 
     return answer_text, "completed", None
 
@@ -434,6 +565,16 @@ class AgentOrchestrator:
             try:
                 response = self.client.chat(messages, format="json", temperature=0.0)
             except LlmTimeoutError:
+                if successful_outputs:
+                    return self._llm_failure_result(
+                        error="llm_timeout",
+                        timeout=True,
+                        executed_summaries=executed_summaries,
+                        successful_outputs=successful_outputs,
+                        grounding_requirement=grounding_requirement,
+                        iteration=iteration,
+                        session_id=session_id,
+                    )
                 return AgentExecutionResult(
                     answer="The request to the local AI service timed out while processing your question.",
                     tool_calls=executed_summaries,
@@ -443,6 +584,16 @@ class AgentOrchestrator:
                     session_id=session_id,
                 )
             except LlmError as err:
+                if successful_outputs:
+                    return self._llm_failure_result(
+                        error="llm_error",
+                        timeout=False,
+                        executed_summaries=executed_summaries,
+                        successful_outputs=successful_outputs,
+                        grounding_requirement=grounding_requirement,
+                        iteration=iteration,
+                        session_id=session_id,
+                    )
                 return AgentExecutionResult(
                     answer=f"The AI service encountered an error: {err}",
                     tool_calls=executed_summaries,
@@ -561,6 +712,28 @@ class AgentOrchestrator:
 
                 if result.status is ToolExecutionStatus.SUCCEEDED:
                     successful_outputs.append((tool_name, result.output))
+                    if grounding_requirement == (_WAREHOUSE_LIST_TOOL,):
+                        warehouse_list = _authoritative_warehouse_list(
+                            successful_outputs
+                        )
+                        if warehouse_list is not None:
+                            return AgentExecutionResult(
+                                answer=warehouse_list,
+                                tool_calls=executed_summaries,
+                                status="completed",
+                                iterations=iteration,
+                                session_id=session_id,
+                            )
+                    if grounding_requirement == (_PRODUCT_COUNT_TOOL,):
+                        product_count = _authoritative_product_count(successful_outputs)
+                        if product_count is not None:
+                            return AgentExecutionResult(
+                                answer=f"There are {product_count} products in the ERP.",
+                                tool_calls=executed_summaries,
+                                status="completed",
+                                iterations=iteration,
+                                session_id=session_id,
+                            )
                     output_str = json.dumps(result.output, ensure_ascii=False, default=str)
                     messages.append(
                         ChatMessage(
@@ -710,17 +883,97 @@ class AgentOrchestrator:
             session_id=session_id,
         )
 
+    def _llm_failure_result(
+        self,
+        *,
+        error: str,
+        timeout: bool,
+        executed_summaries: list[ToolCallSummary],
+        successful_outputs: list[tuple[str, Any]],
+        grounding_requirement: tuple[str, ...] | None,
+        iteration: int,
+        session_id: str | None,
+    ) -> AgentExecutionResult:
+        """Return verified tool data when the LLM fails after a successful call."""
+
+        if grounding_requirement is not None and not _has_required_evidence(
+            grounding_requirement,
+            successful_outputs,
+        ):
+            answer, status, grounding_error = _grounded_answer(
+                grounding_requirement,
+                "",
+                successful_outputs,
+                executed_summaries,
+            )
+            return AgentExecutionResult(
+                answer=answer,
+                tool_calls=executed_summaries,
+                status=status,
+                error=grounding_error,
+                iterations=iteration,
+                session_id=session_id,
+            )
+
+        if grounding_requirement == (_PRODUCT_COUNT_TOOL,):
+            product_count = _authoritative_product_count(successful_outputs)
+            if product_count is None:
+                answer, status, grounding_error = _grounded_answer(
+                    grounding_requirement,
+                    "",
+                    successful_outputs,
+                    executed_summaries,
+                )
+                return AgentExecutionResult(
+                    answer=answer,
+                    tool_calls=executed_summaries,
+                    status=status,
+                    error=grounding_error,
+                    iterations=iteration,
+                    session_id=session_id,
+                )
+            return AgentExecutionResult(
+                answer=f"There are {product_count} products in the ERP.",
+                tool_calls=executed_summaries,
+                status="incomplete",
+                error=error,
+                iterations=iteration,
+                session_id=session_id,
+            )
+
+        intro = (
+            "The AI service timed out before a final answer could be composed. "
+            "The following data was successfully retrieved:"
+            if timeout
+            else "The AI service encountered an error before a final answer could be composed. "
+            "The following data was successfully retrieved:"
+        )
+        return AgentExecutionResult(
+            answer=self._fallback_answer(
+                executed_summaries,
+                successful_outputs,
+                intro=intro,
+            ),
+            tool_calls=executed_summaries,
+            status="incomplete",
+            error=error,
+            iterations=iteration,
+            session_id=session_id,
+        )
+
     @staticmethod
     def _fallback_answer(
         executed_summaries: list[ToolCallSummary],
         successful_outputs: list[tuple[str, Any]],
+        *,
+        intro: str = (
+            "The tool-call limit was reached before a final answer could be "
+            "composed. The following data was successfully retrieved:"
+        ),
     ) -> str:
         """Grounded deterministic answer used when the model cannot compose one."""
 
-        lines: list[str] = [
-            "The tool-call limit was reached before a final answer could be "
-            "composed. The following data was successfully retrieved:"
-        ]
+        lines: list[str] = [intro]
         for tool_name, output in successful_outputs:
             rendered = json.dumps(output, ensure_ascii=False, default=str)
             if len(rendered) > _MAX_FALLBACK_OUTPUT_CHARS:

@@ -47,6 +47,7 @@ class ErpToolHandlers:
             "erp.warehouses.list": self.list_warehouses,
             "erp.inventory.low_stock": self.list_low_stock,
             "erp.sales_orders.get": self.get_sales_order,
+            "erp.sales_orders.search": self.search_sales_orders,
             "erp.dispatches.get": self.get_dispatch,
             "erp.dispatches.list": self.list_dispatches,
             "erp.dispatches.by_sales_order": self.get_dispatches_by_sales_order,
@@ -160,6 +161,22 @@ class ErpToolHandlers:
             arguments,
             lambda args: self._service.get_sales_order(
                 args["so_id"],
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def search_sales_orders(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.sales_orders.search",
+            arguments,
+            lambda args: self._service.search_sales_orders(
+                query=args.get("query"),
+                status=args.get("status"),
+                limit=args.get("limit", 20),
                 timeout_seconds=context.timeout_seconds,
             ),
         )

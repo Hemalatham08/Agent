@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+
 import httpx
 
 from backend.agent.erp.config import ErpDatabaseConfig
@@ -15,7 +17,12 @@ from backend.agent.erp.service import ErpReadService
 from backend.agent.erp.sqlite_adapter import SqliteErpReadAdapter
 from backend.agent.llm.client import OllamaClient
 from backend.agent.llm.config import LlmConfig
+from backend.agent.models import utc_now
 from backend.agent.orchestration.orchestrator import AgentOrchestrator
+from backend.agent.tools.contracts import (
+    ToolExecutionResult,
+    ToolExecutionStatus,
+)
 from backend.agent.tools.executor import ToolExecutor
 from backend.agent.tools.registry import ToolRegistry
 from backend.tests.erp_support import create_erp_fixture_db
@@ -43,9 +50,10 @@ class TestAgentOrchestrator(unittest.TestCase):
 
     def _create_orchestrator(
         self,
-        responses: list[dict[str, Any]],
+        responses: list[dict[str, Any] | Exception | httpx.Response],
         *,
         max_tool_calls: int = 5,
+        chat_calls: list[dict[str, Any]] | None = None,
     ) -> AgentOrchestrator:
         resp_iter = iter(responses)
 
@@ -54,35 +62,30 @@ class TestAgentOrchestrator(unittest.TestCase):
                 return httpx.Response(200, json={"models": [{"name": "llama3.2:latest"}]})
 
             if request.url.path == "/api/chat":
+                if chat_calls is not None:
+                    chat_calls.append(json.loads(request.content))
                 try:
                     resp_data = next(resp_iter)
-                    return httpx.Response(
-                        200,
-                        json={
-                            "model": "llama3.2",
-                            "message": {
-                                "role": "assistant",
-                                "content": json.dumps(resp_data),
-                            },
-                        },
-                    )
                 except StopIteration:
-                    return httpx.Response(
-                        200,
-                        json={
-                            "model": "llama3.2",
-                            "message": {
-                                "role": "assistant",
-                                "content": json.dumps(
-                                    {
-                                        "thought": "No more responses",
-                                        "action": "final_answer",
-                                        "final_answer": "No further information.",
-                                    }
-                                ),
-                            },
+                    resp_data = {
+                        "thought": "No more responses",
+                        "action": "final_answer",
+                        "final_answer": "No further information.",
+                    }
+                if isinstance(resp_data, Exception):
+                    raise resp_data
+                if isinstance(resp_data, httpx.Response):
+                    return resp_data
+                return httpx.Response(
+                    200,
+                    json={
+                        "model": "llama3.2",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(resp_data),
                         },
-                    )
+                    },
+                )
 
             return httpx.Response(404, text="Not found")
 
@@ -120,6 +123,7 @@ class TestAgentOrchestrator(unittest.TestCase):
         self.assertEqual(len(res.tool_calls), 0)
 
     def test_product_count_is_derived_from_registered_tool_output(self) -> None:
+        chat_calls: list[dict[str, Any]] = []
         orchestrator = self._create_orchestrator(
             [
                 {
@@ -133,13 +137,73 @@ class TestAgentOrchestrator(unittest.TestCase):
                     "action": "final_answer",
                     "final_answer": "There are 123 products.",
                 },
-            ]
+            ],
+            chat_calls=chat_calls,
         )
 
         res = orchestrator.process_question("How many products do we have?")
 
+        expected_count = self.service.count_products().product_count
         self.assertEqual(res.status, "completed")
-        self.assertEqual(res.answer, "There are 5 products in the ERP.")
+        self.assertIsNone(res.error)
+        self.assertEqual(
+            res.answer,
+            f"There are {expected_count} products in the ERP.",
+        )
+        self.assertNotIn("123", res.answer)
+        self.assertEqual(len(chat_calls), 1)
+        self.assertEqual(res.iterations, 1)
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].tool_name, "erp.products.count")
+        self.assertEqual(res.tool_calls[0].arguments, {})
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+
+    def test_product_count_short_circuit_uses_current_database_value(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "PRD006",
+                    "HEX-M12-SS316",
+                    "Hex Bolt M12",
+                    "Bolts",
+                    "Stainless Steel",
+                    "M12",
+                    "SS316",
+                    "pieces",
+                    9.0,
+                    14.0,
+                    300,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "Count products",
+                    "action": "call_tool",
+                    "tool_name": "erp.products.count",
+                    "arguments": {},
+                },
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("What is the total number of products?")
+
+        expected_count = self.service.count_products().product_count
+        self.assertEqual(expected_count, 6)
+        self.assertEqual(res.status, "completed")
+        self.assertEqual(
+            res.answer,
+            f"There are {expected_count} products in the ERP.",
+        )
+        self.assertEqual(len(chat_calls), 1)
         self.assertEqual(len(res.tool_calls), 1)
         self.assertEqual(res.tool_calls[0].tool_name, "erp.products.count")
         self.assertEqual(res.tool_calls[0].status, "succeeded")
@@ -284,7 +348,7 @@ class TestAgentOrchestrator(unittest.TestCase):
         self.assertEqual(res.tool_calls[0].status, "succeeded")
         self.assertNotIn("Hex Bolt M10", res.answer)
 
-    def test_product_count_grounding_applies_to_synthesized_answer(self) -> None:
+    def test_product_count_grounding_applies_before_budget_exhaustion(self) -> None:
         orchestrator = self._create_orchestrator(
             [
                 {
@@ -450,6 +514,304 @@ class TestAgentOrchestrator(unittest.TestCase):
         self.assertEqual(len(res.tool_calls), 5)
         self.assertIn("tool-call limit was reached", res.answer)
         self.assertIn("erp.products.search", res.answer)
+
+    def test_llm_timeout_after_successful_tool_preserves_results(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List all products",
+                    "action": "call_tool",
+                    "tool_name": "erp.products.search",
+                    "arguments": {},
+                },
+                httpx.ReadTimeout("timed out"),
+            ]
+        )
+
+        res = orchestrator.process_question("List all products.")
+
+        self.assertEqual(res.status, "incomplete")
+        self.assertEqual(res.error, "llm_timeout")
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+        self.assertIn("PRD001", res.answer)
+        self.assertIn("timed out before a final answer", res.answer)
+
+    def test_llm_error_after_successful_tool_preserves_results(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List all products",
+                    "action": "call_tool",
+                    "tool_name": "erp.products.search",
+                    "arguments": {},
+                },
+                httpx.Response(500, text="chat failed"),
+            ]
+        )
+
+        res = orchestrator.process_question("List all products")
+
+        self.assertEqual(res.status, "incomplete")
+        self.assertEqual(res.error, "llm_error")
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+        self.assertIn("PRD001", res.answer)
+        self.assertIn("encountered an error before a final answer", res.answer)
+
+    def test_llm_timeout_without_successful_tool_keeps_generic_error(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "Try an invalid dispatch limit",
+                    "action": "call_tool",
+                    "tool_name": "erp.dispatches.list",
+                    "arguments": {"limit": 100},
+                },
+                httpx.ReadTimeout("timed out"),
+            ]
+        )
+
+        res = orchestrator.process_question("Give me the list of elements that are delivered")
+
+        self.assertEqual(res.status, "error")
+        self.assertEqual(res.error, "llm_timeout")
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].status, "failed")
+        self.assertIn("timed out while processing your question", res.answer)
+        self.assertNotIn("successfully retrieved", res.answer)
+
+    def test_llm_timeout_after_mixed_results_preserves_only_success(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List products",
+                    "action": "call_tool",
+                    "tool_name": "erp.products.search",
+                    "arguments": {},
+                },
+                {
+                    "thought": "Check an unknown product",
+                    "action": "call_tool",
+                    "tool_name": "erp.inventory.get",
+                    "arguments": {"product_id": "PRD999"},
+                },
+                httpx.ReadTimeout("timed out"),
+            ]
+        )
+
+        res = orchestrator.process_question("List all products.")
+
+        self.assertEqual(res.status, "incomplete")
+        self.assertEqual(res.error, "llm_timeout")
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+        self.assertEqual(res.tool_calls[1].status, "failed")
+        self.assertIn("PRD001", res.answer)
+        self.assertIn("Tool calls that did not return data", res.answer)
+        self.assertIn("erp.inventory.get", res.answer)
+        self.assertNotIn("PRD999", res.answer)
+
+    def test_product_count_short_circuit_avoids_followup_llm_timeout(self) -> None:
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "Count products",
+                    "action": "call_tool",
+                    "tool_name": "erp.products.count",
+                    "arguments": {},
+                },
+                httpx.ReadTimeout("timed out"),
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("How many products do we have?")
+
+        self.assertEqual(res.status, "completed")
+        self.assertIsNone(res.error)
+        self.assertEqual(res.answer, "There are 5 products in the ERP.")
+        self.assertEqual(len(chat_calls), 1)
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+
+    def test_warehouse_list_is_rendered_deterministically(self) -> None:
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List warehouses",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {},
+                },
+                {
+                    "thought": "Invent a list",
+                    "action": "final_answer",
+                    "final_answer": "There are 99 warehouses including WH999.",
+                },
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("List all warehouses")
+
+        self.assertEqual(res.status, "completed")
+        self.assertIsNone(res.error)
+        self.assertEqual(len(chat_calls), 1)
+        self.assertEqual(res.iterations, 1)
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].tool_name, "erp.warehouses.list")
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+        self.assertIn("Main Warehouse", res.answer)
+        self.assertIn("WH001", res.answer)
+        self.assertIn("Chennai", res.answer)
+        self.assertIn("Secondary Warehouse", res.answer)
+        self.assertIn("WH002", res.answer)
+        self.assertIn("Coimbatore", res.answer)
+        self.assertNotIn("999", res.answer)
+
+    def test_warehouse_list_empty_result_is_truthful(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("DELETE FROM inventory")
+            connection.execute("DELETE FROM warehouses")
+            connection.commit()
+        finally:
+            connection.close()
+
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List warehouses",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {},
+                },
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("List all warehouses")
+
+        self.assertEqual(res.status, "completed")
+        self.assertIsNone(res.error)
+        self.assertEqual(res.answer, "There are no warehouses in the ERP.")
+        self.assertEqual(len(chat_calls), 1)
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].status, "succeeded")
+
+    def test_failed_warehouse_list_cannot_support_final_answer(self) -> None:
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List warehouses with an invalid argument",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {"limit": 10},
+                },
+                {
+                    "thought": "Answer despite failure",
+                    "action": "final_answer",
+                    "final_answer": "There is one warehouse: Main Warehouse (WH001).",
+                },
+            ]
+        )
+
+        res = orchestrator.process_question("List all warehouses")
+
+        self.assertEqual(res.status, "error")
+        self.assertEqual(res.error, "tool_evidence_failed")
+        self.assertEqual(res.tool_calls[0].status, "failed")
+        self.assertNotIn("WH001", res.answer)
+        self.assertNotIn("Main Warehouse", res.answer)
+
+    def test_malformed_warehouse_output_does_not_invent_records(self) -> None:
+        now = utc_now()
+        malformed = ToolExecutionResult(
+            execution_id="exec-malformed-warehouses",
+            tool_name="erp.warehouses.list",
+            status=ToolExecutionStatus.SUCCEEDED,
+            output={"items": [{"warehouse_id": "WH001"}], "row_count": 1},
+            started_at=now,
+            finished_at=now,
+            duration_ms=1.0,
+        )
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "List warehouses",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {},
+                },
+                {
+                    "thought": "Answer from raw output",
+                    "action": "final_answer",
+                    "final_answer": "Main Warehouse (WH001) in Chennai.",
+                },
+            ]
+        )
+
+        with patch.object(self.runner, "execute", return_value=malformed):
+            res = orchestrator.process_question("List all warehouses")
+
+        self.assertEqual(res.status, "error")
+        self.assertEqual(res.error, "invalid_tool_evidence")
+        self.assertNotIn("WH001", res.answer)
+        self.assertNotIn("Main Warehouse", res.answer)
+
+    def test_warehouse_stock_question_is_not_deterministic(self) -> None:
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "Check warehouse stock",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {},
+                },
+                {
+                    "thought": "Summarize stock",
+                    "action": "final_answer",
+                    "final_answer": "WH002 has the lowest stock.",
+                },
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("Which warehouse has the lowest stock?")
+
+        self.assertEqual(res.status, "completed")
+        self.assertEqual(len(chat_calls), 2)
+        self.assertEqual(res.answer, "WH002 has the lowest stock.")
+
+    def test_unrelated_warehouse_question_is_not_deterministic(self) -> None:
+        chat_calls: list[dict[str, Any]] = []
+        orchestrator = self._create_orchestrator(
+            [
+                {
+                    "thought": "Look up warehouse details",
+                    "action": "call_tool",
+                    "tool_name": "erp.warehouses.list",
+                    "arguments": {},
+                },
+                {
+                    "thought": "Answer the warehouse question",
+                    "action": "final_answer",
+                    "final_answer": "The main warehouse is in Chennai.",
+                },
+            ],
+            chat_calls=chat_calls,
+        )
+
+        res = orchestrator.process_question("What is the address of the main warehouse?")
+
+        self.assertEqual(res.status, "completed")
+        self.assertEqual(len(chat_calls), 2)
+        self.assertEqual(res.answer, "The main warehouse is in Chennai.")
+        self.assertNotIn("There are 2 warehouses in the ERP:", res.answer)
 
     def test_successful_single_tool_call(self) -> None:
         orchestrator = self._create_orchestrator(

@@ -131,6 +131,12 @@ class SalesOrderDispatchesResult(ErpModel):
     dispatches_truncated: bool
 
 
+class SalesOrderSearchResult(ErpModel):
+    items: list[SalesOrderDetail]
+    row_count: int = Field(ge=0)
+    truncated: bool
+
+
 __all__ = [
     "DispatchDetail",
     "DispatchItemDetail",
@@ -149,6 +155,7 @@ __all__ = [
     "SalesOrderDispatchesResult",
     "SalesOrderHeader",
     "SalesOrderItem",
+    "SalesOrderSearchResult",
     "WarehouseListResult",
     "WarehouseSummary",
 ]

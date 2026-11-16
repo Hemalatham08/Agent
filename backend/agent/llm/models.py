@@ -27,8 +27,15 @@ class LLMResponse(BaseModel):
     content: str
     model: str
     duration_ms: float | None = None
+    request_duration_ms: float | None = None
+    total_duration_ns: int | None = None
+    load_duration_ns: int | None = None
     prompt_eval_count: int | None = None
+    prompt_eval_duration_ns: int | None = None
     eval_count: int | None = None
+    eval_duration_ns: int | None = None
+    done_reason: str | None = None
+    truncated: bool = False
 
 
 class ModelInfo(BaseModel):
