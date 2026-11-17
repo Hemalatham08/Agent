@@ -34,12 +34,14 @@ deterministic for a given corpus.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from backend.agent.rag.bm25 import Bm25Index
 from backend.agent.rag.chunking import (
     DEFAULT_MAX_CHUNK_CHARS,
     DEFAULT_MIN_CHUNK_CHARS,
@@ -76,6 +78,8 @@ ALLOW_LINE_MARKER = "rag-lint: allow-line"
 MAX_BODY_CHARS = 20_000
 INDEX_VERSION_CHARS = 12
 MAX_EXCERPT_CHARS = 120
+
+MANIFEST_FILENAME = "corpus-manifest.json"
 
 _FRONT_MATTER_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
@@ -129,6 +133,21 @@ class LiveFactViolation:
     excerpt: str
 
 
+@dataclass(frozen=True)
+class CorpusManifest:
+    """Version and content-hash manifest for a knowledge corpus.
+
+    The filesystem is authoritative; the manifest is a cache that lets callers
+    detect whether the corpus has changed since it was last indexed. A missing,
+    stale, or malformed manifest safely triggers full regeneration.
+    """
+
+    version: str
+    doc_hashes: dict[str, str]
+    index_version: str
+    document_count: int
+
+
 def find_live_fact_violations(text: str) -> tuple[LiveFactViolation, ...]:
     """Return live ERP fact candidates found in ``text``.
 
@@ -156,6 +175,284 @@ def find_live_fact_violations(text: str) -> tuple[LiveFactViolation, ...]:
                 )
                 break
     return tuple(violations)
+
+
+def _manifest_path(knowledge_dir: Path) -> Path:
+    return knowledge_dir / MANIFEST_FILENAME
+
+
+def read_manifest(knowledge_dir: str | Path) -> CorpusManifest | None:
+    """Read and validate the corpus manifest, if present.
+
+    Returns ``None`` when the manifest is missing, malformed, or fails
+    validation. The filesystem is authoritative: a bad manifest never blocks
+    loading; it simply triggers regeneration.
+    """
+
+    root = Path(knowledge_dir).expanduser()
+    try:
+        root = root.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    manifest_file = _manifest_path(root)
+    if not manifest_file.is_file():
+        return None
+
+    try:
+        raw = manifest_file.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+    try:
+        return CorpusManifest(
+            version=str(data["version"]),
+            doc_hashes={str(k): str(v) for k, v in data["doc_hashes"].items()},
+            index_version=str(data["index_version"]),
+            document_count=int(data["document_count"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def write_manifest(knowledge_dir: str | Path, bundle: CorpusBundle) -> None:
+    """Write a corpus manifest for ``bundle`` into ``knowledge_dir``.
+
+    The manifest records document content hashes and the index version so that
+    callers can detect corpus changes between builds.
+    """
+
+    root = Path(knowledge_dir).expanduser()
+    try:
+        root = root.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return
+
+    manifest_file = _manifest_path(root)
+    try:
+        manifest = CorpusManifest(
+            version=bundle.index_version,
+            doc_hashes={
+                document.doc_id: document.content_hash
+                for document in bundle.documents
+            },
+            index_version=bundle.index_version,
+            document_count=len(bundle.documents),
+        )
+        payload = json.dumps(
+            {
+                "version": manifest.version,
+                "doc_hashes": manifest.doc_hashes,
+                "index_version": manifest.index_version,
+                "document_count": manifest.document_count,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        manifest_file.write_text(payload, encoding="utf-8")
+    except OSError:
+        # Manifest writes are best-effort; a failure to write the manifest must
+        # never prevent corpus loading.
+        return
+
+
+def _index_version_for_files(root: Path) -> str | None:
+    """Recompute the corpus index version from the files on disk.
+
+    Mirrors :func:`index_version_for`: for every ``.md`` document file, parse
+    the front matter to get ``doc_id``, compute the content hash from the
+    normalized file text, then hash ``(doc_id, content_hash)`` pairs sorted by
+    ``doc_id``. Returns ``None`` if any file cannot be read or parsed.
+    """
+
+    entries_list: list[tuple[str, str]] = []
+    for category_dir in sorted(root.iterdir(), key=lambda item: item.name):
+        if not category_dir.is_dir() or category_dir.name.startswith("."):
+            continue
+        for child in sorted(category_dir.iterdir(), key=lambda item: item.name):
+            if not child.is_file() or child.suffix.lower() != ".md":
+                continue
+            try:
+                raw = child.read_bytes()
+                text = raw.decode("utf-8-sig")
+                normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+                file_entries, _body, _normalized, _line = _parse_front_matter(
+                    text, path=child.relative_to(root).as_posix()
+                )
+                doc_id = _unquote(file_entries["doc_id"][0]).strip()
+            except (OSError, UnicodeDecodeError, KeyError, RagCorpusError):
+                return None
+            content_hash = hashlib.sha256(
+                normalized.encode("utf-8")
+            ).hexdigest()
+            entries_list.append((doc_id, content_hash))
+
+    hasher = hashlib.sha256()
+    for doc_id, content_hash in sorted(entries_list, key=lambda item: item[0]):
+        hasher.update(doc_id.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(content_hash.encode("ascii"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()[:INDEX_VERSION_CHARS]
+
+
+def manifest_matches_filesystem(
+    knowledge_dir: str | Path,
+    manifest: CorpusManifest,
+) -> bool:
+    """Return ``True`` when ``manifest`` matches the current filesystem state.
+
+    Compares each recorded document content hash against the hash computed from
+    the file currently on disk, verifies the document count, and recomputes the
+    content-derived index version to confirm it matches the manifest. Missing
+    files, changed content, new documents, count drift, or version drift cause
+    a ``False`` result.
+    """
+
+    root = Path(knowledge_dir).expanduser()
+    try:
+        root = root.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    # Internal consistency: version and index_version are written together and
+    # must agree.
+    if manifest.version != manifest.index_version:
+        return False
+
+    # Every documented hash must match its file on disk.
+    for doc_id, recorded_hash in manifest.doc_hashes.items():
+        found = False
+        for category_dir in root.iterdir():
+            if not category_dir.is_dir() or category_dir.name.startswith("."):
+                continue
+            candidate = category_dir / f"{doc_id}.md"
+            if candidate.is_file():
+                found = True
+                try:
+                    raw = candidate.read_bytes()
+                    text = raw.decode("utf-8-sig")
+                    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+                    actual_hash = hashlib.sha256(
+                        normalized.encode("utf-8")
+                    ).hexdigest()
+                except (OSError, UnicodeDecodeError):
+                    return False
+                if actual_hash != recorded_hash:
+                    return False
+                break
+        if not found:
+            return False
+
+    # No extra documents may exist on disk that aren't in the manifest.
+    actual_doc_ids: set[str] = set()
+    for category_dir in root.iterdir():
+        if not category_dir.is_dir() or category_dir.name.startswith("."):
+            continue
+        for child in category_dir.iterdir():
+            if child.is_file() and child.suffix.lower() == ".md":
+                actual_doc_ids.add(child.stem)
+
+    if manifest.document_count != len(actual_doc_ids):
+        return False
+    if actual_doc_ids != set(manifest.doc_hashes.keys()):
+        return False
+
+    # The content-derived index version must match the manifest.
+    recomputed = _index_version_for_files(root)
+    if recomputed is None or recomputed != manifest.index_version:
+        return False
+
+    return True
+
+
+def inspect_manifest(knowledge_dir: str | Path) -> ManifestInspection:
+    """Inspect the corpus manifest against the filesystem.
+
+    Returns a :class:`ManifestInspection`` with one of four statuses:
+
+    * ``missing``: no manifest file exists.
+    * ``malformed``: the file exists but cannot be read, parsed, or validated.
+    * ``stale``: the manifest parses but its hashes, count, or version disagree
+      with the files on disk.
+    * ``current``: the manifest parses and matches the filesystem exactly.
+
+    This function never raises for a bad manifest; it reports ``malformed``
+    instead. The filesystem remains authoritative.
+    """
+
+    from backend.agent.rag.diagnostics import ManifestInspection, ManifestStatus
+
+    root = Path(knowledge_dir).expanduser()
+    try:
+        root = root.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return ManifestInspection(
+            status=ManifestStatus.MALFORMED,
+            document_count=None,
+            index_version=None,
+            recorded_hashes=0,
+        )
+
+    manifest_file = _manifest_path(root)
+    if not manifest_file.is_file():
+        return ManifestInspection(
+            status=ManifestStatus.MISSING,
+            document_count=None,
+            index_version=None,
+            recorded_hashes=0,
+        )
+
+    manifest = read_manifest(root)
+    if manifest is None:
+        return ManifestInspection(
+            status=ManifestStatus.MALFORMED,
+            document_count=None,
+            index_version=None,
+            recorded_hashes=0,
+        )
+
+    matches = manifest_matches_filesystem(root, manifest)
+    return ManifestInspection(
+        status=ManifestStatus.CURRENT if matches else ManifestStatus.STALE,
+        document_count=manifest.document_count,
+        index_version=manifest.index_version,
+        recorded_hashes=len(manifest.doc_hashes),
+    )
+
+
+def detect_duplicate_content(
+    documents: tuple[KnowledgeDocument, ...],
+) -> list[tuple[str, str, str]]:
+    """Return pairs of documents with identical body content.
+
+    Each entry is ``(doc_id_1, doc_id_2, content_hash)`` where both documents
+    share the same SHA-256 hash of their body text. Different ``doc_id`` values
+    with the same body content indicate duplicate documentation that may
+    warrant review.
+
+    Only the body text is compared, not front matter metadata, so documents
+    with identical prose but different titles or categories are flagged.
+    """
+
+    by_hash: dict[str, list[str]] = {}
+    for document in documents:
+        body_hash = hashlib.sha256(
+            document.body.encode("utf-8")
+        ).hexdigest()
+        by_hash.setdefault(body_hash, []).append(document.doc_id)
+
+    duplicates: list[tuple[str, str, str]] = []
+    for body_hash, doc_ids in by_hash.items():
+        if len(doc_ids) > 1:
+            sorted_ids = sorted(doc_ids)
+            for i in range(len(sorted_ids)):
+                for j in range(i + 1, len(sorted_ids)):
+                    duplicates.append(
+                        (sorted_ids[i], sorted_ids[j], body_hash)
+                    )
+    return duplicates
 
 
 def _unquote(value: str) -> str:
@@ -400,6 +697,28 @@ def _load_document(root: Path, category: str, path: Path) -> KnowledgeDocument:
             rule=f"live_fact:{first.rule}",
         )
 
+    for field_name, field_value in (
+        ("summary", summary),
+        ("tags", " ".join(tags)),
+        ("aliases", " ".join(aliases)),
+    ):
+        metadata_violations = find_live_fact_violations(field_value)
+        if metadata_violations:
+            first = metadata_violations[0]
+            description = next(
+                message
+                for rule, _pattern, message in LIVE_FACT_RULES
+                if rule == first.rule
+            )
+            raise RagCorpusError(
+                f"live ERP fact detected in {field_name} "
+                f"({description}): '{first.excerpt}'. "
+                "Documentation metadata must not contain live business values.",
+                path=relative,
+                line=entries[field_name][1],
+                rule=f"live_fact_metadata:{field_name}:{first.rule}",
+            )
+
     try:
         return KnowledgeDocument(
             doc_id=doc_id,
@@ -527,8 +846,23 @@ def load_corpus_from_dir(
     *,
     max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
     min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
+    reject_duplicate_content: bool = False,
 ) -> CorpusBundle:
-    """Load and validate a knowledge directory into a deterministic bundle."""
+    """Load and validate a knowledge directory into a deterministic bundle.
+
+    All validation happens before any chunking, so loading is all-or-nothing:
+    if any document fails validation, no bundle is returned and the caller's
+    existing index (if any) is left untouched.
+
+    Parameters
+    ----------
+    reject_duplicate_content:
+        When ``True``, documents with identical content hashes but different
+        ``doc_id`` values cause the load to fail with rule
+        ``duplicate_content``. When ``False`` (default), duplicates are
+        detected and recorded but do not block loading, since identical
+        documentation may be legitimate in some deployments.
+    """
 
     root = Path(knowledge_dir).expanduser()
     try:
@@ -589,10 +923,26 @@ def load_corpus_from_dir(
         documents.append(document)
         chunks.extend(document_chunks)
 
+    document_tuple = tuple(documents)
+    chunks_tuple = tuple(chunks)
+
+    # Duplicate content detection: identical SHA-256 content hashes across
+    # different doc_ids. By default this is detected but not fatal; callers
+    # may opt into rejection with reject_duplicate_content=True.
+    duplicates = detect_duplicate_content(document_tuple)
+    if duplicates and reject_duplicate_content:
+        first = duplicates[0]
+        raise RagCorpusError(
+            f"duplicate content detected between '{first[0]}' and "
+            f"'{first[1]}' (identical content hash {first[2][:16]}...)",
+            path="",
+            rule="duplicate_content",
+        )
+
     return CorpusBundle(
-        documents=tuple(documents),
-        chunks=tuple(chunks),
-        index_version=index_version_for(tuple(documents)),
+        documents=document_tuple,
+        chunks=chunks_tuple,
+        index_version=index_version_for(document_tuple),
     )
 
 
@@ -609,15 +959,66 @@ def load_corpus(config: RagConfig) -> CorpusBundle:
     )
 
 
+def load_corpus_with_recovery(
+    index: Bm25Index,
+    knowledge_dir: str | Path,
+    *,
+    max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+    min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
+    reject_duplicate_content: bool = False,
+) -> CorpusBundle:
+    """Load a corpus with recovery guarantees.
+
+    Builds a new :class:`CorpusBundle` from ``knowledge_dir`` and atomically
+    replaces the index state via :meth:`Bm25Index.rebuild`. If loading,
+    validation, chunking, or index construction fails, the previous valid
+    bundle and index are left untouched and the error is propagated to the
+    caller.
+
+    This is the safe pattern for production use:
+
+    .. code-block:: python
+
+        bundle = load_corpus_with_recovery(index, config.knowledge_dir)
+
+    Parameters
+    ----------
+    index:
+        The :class:`~backend.agent.rag.bm25.Bm25Index` to update on success.
+        On failure, the index retains its previous state.
+    knowledge_dir:
+        Path to the knowledge directory.
+    reject_duplicate_content:
+        See :func:`load_corpus_from_dir`.
+    """
+
+    bundle = load_corpus_from_dir(
+        knowledge_dir,
+        max_chunk_chars=max_chunk_chars,
+        min_chunk_chars=min_chunk_chars,
+        reject_duplicate_content=reject_duplicate_content,
+    )
+    index.rebuild(bundle)
+    return bundle
+
+
 __all__ = [
     "ALLOW_LINE_MARKER",
     "CATEGORIES",
+    "CorpusManifest",
     "FRONT_MATTER_DELIMITER",
     "LIVE_FACT_RULES",
+    "MANIFEST_FILENAME",
     "MAX_BODY_CHARS",
     "LiveFactViolation",
+    "detect_duplicate_content",
     "find_live_fact_violations",
     "index_version_for",
     "load_corpus",
     "load_corpus_from_dir",
+    "load_corpus_with_recovery",
+    "manifest_matches_filesystem",
+    "inspect_manifest",
+    "read_manifest",
+    "write_manifest",
 ]

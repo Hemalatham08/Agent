@@ -312,10 +312,39 @@ def _validate_size(value: object, name: str, minimum: int, maximum: int) -> int:
 
 
 def searchable_text(chunk: KnowledgeChunk) -> str:
-    """Return the exact text whose tokens populate the BM25 index."""
+    """Return the exact text whose tokens populate the BM25 index.
+
+    Composition: ``title + section + summary + tags + aliases + body``.
+    """
 
     section = " > ".join(chunk.section_path) or "Overview"
-    return f"{chunk.title}\n{section}\n{chunk.text}"
+    alias_text = " ".join(chunk.aliases)
+    tag_text = " ".join(chunk.tags)
+    return f"{chunk.title}\n{section}\n{chunk.search_summary}\n{tag_text}\n{alias_text}\n{chunk.text}"
+
+
+def _is_title_only_chunk(chunk: KnowledgeChunk) -> bool:
+    """Return True when a chunk holds only the document title and no body text.
+
+    Such chunks add retrieval noise without contributing content; the title is
+    already part of every chunk's searchable text, so nothing is lost by
+    dropping them.
+    """
+
+    stripped = chunk.text.strip()
+    return stripped == chunk.title and "\n" not in stripped
+
+
+def _is_nav_group(group: _Group) -> bool:
+    """Return True when a group is a navigation / cross-reference section.
+
+    ``Related topics`` / ``Related documentation`` sections contain only links
+    to other documents and no substantive content of their own; those target
+    documents are indexed separately, so the cross-reference chunks add noise
+    without unique answer content.
+    """
+
+    return any("related" in part.lower() for part in group.section_path)
 
 
 def chunk_document(
@@ -365,6 +394,7 @@ def chunk_document(
         group
         for group in groups
         if _non_ws_len(group.text) >= MIN_MEANINGFUL_CHARS
+        and not _is_nav_group(group)
     ]
 
     ordinals: dict[str, int] = {}
@@ -385,7 +415,9 @@ def chunk_document(
         ordinals[section_slug] = ordinal
 
         section_display = " > ".join(group.section_path) or "Overview"
-        searchable = f"{doc.title}\n{section_display}\n{text}"
+        alias_text = " ".join(doc.aliases)
+        tag_text = " ".join(doc.tags)
+        searchable = f"{doc.title}\n{section_display}\n{doc.summary}\n{tag_text}\n{alias_text}\n{text}"
 
         chunks.append(
             KnowledgeChunk(
@@ -397,12 +429,20 @@ def chunk_document(
                 fact_kind=doc.fact_kind,
                 text=text,
                 token_count=len(tokenize(searchable)),
+                aliases=doc.aliases,
+                search_summary=doc.summary,
+                tags=doc.tags,
                 source_path=doc.source_path,
                 updated_at=doc.updated_at,
             )
         )
 
-    return tuple(chunks)
+    # Drop title-only chunks (document title with no body text); the title is
+    # already part of every chunk's searchable text, so nothing is lost.
+    filtered = [chunk for chunk in chunks if not _is_title_only_chunk(chunk)]
+    if not filtered:
+        filtered = chunks  # never drop every chunk of a document
+    return tuple(filtered)
 
 
 __all__ = [

@@ -434,5 +434,128 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(query, original)
 
 
+class GuardRecallImprovementTests(unittest.TestCase):
+    """Tests for Phase 2 guard recall improvements (G1-G7).
+
+    These verify that previously-ambiguous documentation questions are now
+    allowed, while live-data indicators still take precedence.
+    """
+
+    def test_workflow_lifecycle_transition_is_allowed(self) -> None:
+        """G1: 'What happens after X is confirmed?' is a workflow question."""
+        decision = classify_query("What happens after a sales order is confirmed?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertIs(decision.reason, GuardReason.DOCUMENTATION_INTENT)
+        self.assertEqual(decision.suggested_category, "workflows")
+
+    def test_what_comes_next_is_allowed(self) -> None:
+        """G1: 'What comes next?' workflow framing is allowed."""
+        decision = classify_query("What comes next after order confirmation?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertEqual(decision.suggested_category, "workflows")
+
+    def test_which_statuses_definition_is_allowed(self) -> None:
+        """G2: 'Which statuses can X have?' is definitional, not a listing."""
+        decision = classify_query("Which statuses can a sales order have?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertIs(decision.reason, GuardReason.DOCUMENTATION_INTENT)
+        self.assertEqual(decision.suggested_category, "business_definitions")
+
+    def test_documentation_live_totals_is_allowed(self) -> None:
+        """G3: 'Can documentation be used for live totals?' is about policy."""
+        decision = classify_query("Can documentation be used for live totals?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertIs(decision.reason, GuardReason.DOCUMENTATION_INTENT)
+        self.assertEqual(decision.suggested_category, "erp_docs")
+
+    def test_schema_tables_is_allowed(self) -> None:
+        """G4: Bare 'tables' is a schema question."""
+        decision = classify_query("What tables store sales orders?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertIs(decision.reason, GuardReason.DOCUMENTATION_INTENT)
+        self.assertEqual(decision.suggested_category, "schema")
+
+    def test_who_approves_workflow_is_allowed(self) -> None:
+        """G5: 'Who approves X?' is a workflow responsibility question."""
+        decision = classify_query("Who approves a stock adjustment?")
+        self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+        self.assertIs(decision.reason, GuardReason.DOCUMENTATION_INTENT)
+        self.assertEqual(decision.suggested_category, "workflows")
+
+    def test_bare_documentation_aliases_are_allowed(self) -> None:
+        """G6: Curated documentation-reference aliases are allowed."""
+        aliases = (
+            "item master",
+            "product master",
+            "database schema",
+            "erp overview",
+            "procurement workflow",
+            "order fulfilment",
+            "delivery workflow",
+            "live data policy",
+            "documentation policy",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                decision = classify_query(alias)
+                self.assertIs(decision.verdict, GuardVerdict.ALLOWED)
+                self.assertIsNone(decision.live_fact_kind)
+
+    def test_bare_aliases_are_deterministic(self) -> None:
+        """G6: Bare alias classification is stable across repeated calls."""
+        for alias in ("item master", "database schema", "erp overview"):
+            with self.subTest(alias=alias):
+                first = classify_query(alias)
+                second = classify_query(alias)
+                self.assertEqual(first, second)
+
+    def test_live_data_takes_precedence_over_doc_reference(self) -> None:
+        """Requirement #4: live-data indicators win over doc-reference rules."""
+        # A record ID with an alias-like term must still be blocked.
+        decision = classify_query("What is the status of item master SO-1001?")
+        self.assertIs(decision.verdict, GuardVerdict.BLOCKED)
+        self.assertEqual(decision.live_fact_kind, "status")
+
+        # A count question mentioning documentation must still be blocked.
+        decision = classify_query("How many item masters are there?")
+        self.assertIs(decision.verdict, GuardVerdict.BLOCKED)
+        self.assertEqual(decision.live_fact_kind, "count")
+
+    def test_documentation_plus_live_data_is_ambiguous(self) -> None:
+        """Requirement #5: documentation + live-data combinations are not allowed."""
+        cases = (
+            "What does free stock mean and what is the current stock level?",
+            "Explain the sales order workflow and show me all open orders.",
+            "List products and explain SKUs.",
+            "What is the current stock policy?",
+            "What is the current invoice amount policy?",
+            "Describe the dispatch process and give me the status of SO-1001.",
+        )
+        for query in cases:
+            with self.subTest(query=query):
+                decision = classify_query(query)
+                self.assertIn(
+                    decision.verdict,
+                    {GuardVerdict.AMBIGUOUS, GuardVerdict.BLOCKED},
+                    f"{query!r} was {decision.verdict.value}, expected ambiguous/blocked",
+                )
+
+    def test_listing_with_definition_stays_ambiguous(self) -> None:
+        """Imperative list verbs with definition terms stay ambiguous (G2 is narrow)."""
+        decision = classify_query("List products and explain SKUs.")
+        self.assertIs(decision.verdict, GuardVerdict.AMBIGUOUS)
+        self.assertIs(decision.reason, GuardReason.MIXED_INTENT)
+
+    def test_domain_without_intent_stays_ambiguous(self) -> None:
+        """Bare domain terms that are not doc references stay ambiguous."""
+        for query in ("stock", "products", "order status", "inventory", "item"):
+            with self.subTest(query=query):
+                decision = classify_query(query)
+                self.assertIs(decision.verdict, GuardVerdict.AMBIGUOUS)
+                self.assertIs(
+                    decision.reason, GuardReason.UNSPECIFIED_DOMAIN
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

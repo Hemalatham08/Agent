@@ -185,6 +185,7 @@ class KnowledgeDocument(BaseModel):
     summary: RagSummary
     tags: tuple[str, ...] = ()
     aliases: tuple[str, ...] = ()
+    search_summary: str = ""
     source_path: Annotated[
         RagSourcePath,
         Field(description="Posix-relative path inside the knowledge directory."),
@@ -219,6 +220,9 @@ class KnowledgeChunk(BaseModel):
     fact_kind: FactKind
     text: RagChunkText
     token_count: int = Field(ge=0)
+    aliases: tuple[str, ...] = ()
+    search_summary: str = ""
+    tags: tuple[str, ...] = ()
     source_path: RagSourcePath
     updated_at: date
 
