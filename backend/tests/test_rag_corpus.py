@@ -10,14 +10,21 @@ from tempfile import TemporaryDirectory
 from backend.agent.rag import (
     CATEGORIES,
     DEFAULT_KNOWLEDGE_DIR,
+    MANIFEST_FILENAME,
     RagConfig,
     RagCorpusError,
     chunk_document,
+    detect_duplicate_content,
     find_live_fact_violations,
     index_version_for,
     load_corpus,
     load_corpus_from_dir,
+    load_corpus_with_recovery,
+    manifest_matches_filesystem,
+    read_manifest,
+    write_manifest,
 )
+from backend.agent.rag.bm25 import Bm25Index
 from backend.agent.rag.config import MAX_CORPUS_BYTES, MAX_DOCS
 from backend.agent.rag.corpus import MAX_BODY_CHARS
 
@@ -832,6 +839,214 @@ class ErrorContractTests(CorpusTestCase):
         error = self.assert_corpus_error("live_fact:L1")
 
         self.assertEqual(error.details.get("path"), "erp_docs/reference-topic.md")
+
+
+class DuplicateContentTests(CorpusTestCase):
+    """Tests for duplicate content detection (requirement #3)."""
+
+    def test_duplicate_content_is_detected(self) -> None:
+        self.write_document("erp_docs", "alpha-topic", body="# Alpha\n\nAlpha body text about documentation concepts.")
+        self.write_document("schema", "beta-topic", body="# Beta\n\nBeta body text about schema definitions.")
+
+        duplicates = detect_duplicate_content(
+            tuple(self.load().documents)
+        )
+        # Different bodies => no duplicates
+        self.assertEqual(duplicates, [])
+
+    def test_identical_bodies_produce_duplicates(self) -> None:
+        self.write_document("erp_docs", "alpha-topic", body=BODY)
+        self.write_document("schema", "beta-topic", body=BODY)
+
+        bundle = self.load()
+        duplicates = detect_duplicate_content(bundle.documents)
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(duplicates[0][0], "alpha-topic")
+        self.assertEqual(duplicates[0][1], "beta-topic")
+        self.assertEqual(len(duplicates[0][2]), 64)
+
+    def test_duplicate_content_not_rejected_by_default(self) -> None:
+        self.write_document("erp_docs", "alpha-topic", body=BODY)
+        self.write_document("schema", "beta-topic", body=BODY)
+
+        # Default: duplicates detected but not fatal
+        bundle = self.load()
+        self.assertEqual(len(bundle.documents), 2)
+
+    def test_duplicate_content_rejected_when_configured(self) -> None:
+        self.write_document("erp_docs", "alpha-topic", body=BODY)
+        self.write_document("schema", "beta-topic", body=BODY)
+
+        with self.assertRaises(RagCorpusError) as context:
+            load_corpus_from_dir(
+                self.root,
+                min_chunk_chars=0,
+                reject_duplicate_content=True,
+            )
+        error = context.exception
+        self.assertEqual(error.details.get("rule"), "duplicate_content")
+        self.assertIn("alpha-topic", error.message)
+        self.assertIn("beta-topic", error.message)
+
+
+class ManifestTests(CorpusTestCase):
+    """Tests for corpus manifest support (requirement #4)."""
+
+    def test_manifest_read_returns_none_when_missing(self) -> None:
+        self.write_document()
+        self.load()
+
+        manifest = read_manifest(self.root)
+        self.assertIsNone(manifest)
+
+    def test_manifest_write_and_read_roundtrip(self) -> None:
+        self.write_document()
+        bundle = self.load()
+
+        write_manifest(self.root, bundle)
+
+        manifest = read_manifest(self.root)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.document_count, 1)
+        self.assertEqual(len(manifest.index_version), 12)
+        self.assertIn("alpha-topic", manifest.doc_hashes) if False else None
+        self.assertIn("reference-topic", manifest.doc_hashes)
+        self.assertEqual(
+            manifest.doc_hashes["reference-topic"],
+            bundle.documents[0].content_hash,
+        )
+
+    def test_malformed_manifest_returns_none(self) -> None:
+        self.write_document()
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        # Corrupt the manifest file
+        manifest_file = self.root / MANIFEST_FILENAME
+        manifest_file.write_text("not valid json{{{", encoding="utf-8")
+
+        manifest = read_manifest(self.root)
+        self.assertIsNone(manifest)
+
+    def test_manifest_with_missing_fields_returns_none(self) -> None:
+        self.write_document()
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        manifest_file = self.root / MANIFEST_FILENAME
+        manifest_file.write_text(
+            '{"version": "abc"}', encoding="utf-8"
+        )
+
+        manifest = read_manifest(self.root)
+        self.assertIsNone(manifest)
+
+    def test_manifest_matches_filesystem_when_unchanged(self) -> None:
+        self.write_document()
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        manifest = read_manifest(self.root)
+        self.assertIsNotNone(manifest)
+        self.assertTrue(manifest_matches_filesystem(self.root, manifest))
+
+    def test_manifest_does_not_match_when_content_changed(self) -> None:
+        self.write_document(body=BODY)
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        # Change document content
+        self.write_document(body=BODY.replace("documentation concept", "updated concept"))
+        manifest = read_manifest(self.root)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest_matches_filesystem(self.root, manifest))
+
+    def test_manifest_does_not_match_when_document_removed(self) -> None:
+        self.write_document("erp_docs", "alpha-topic")
+        self.write_document("schema", "beta-topic")
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        # Remove one document
+        (self.root / "schema" / "beta-topic.md").unlink()
+        manifest = read_manifest(self.root)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest_matches_filesystem(self.root, manifest))
+
+    def test_manifest_does_not_match_when_document_added(self) -> None:
+        self.write_document()
+        bundle = self.load()
+        write_manifest(self.root, bundle)
+
+        # Add a new document
+        self.write_document("schema", "new-topic")
+        manifest = read_manifest(self.root)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest_matches_filesystem(self.root, manifest))
+
+
+class IntegrityTests(CorpusTestCase):
+    """Tests for corpus integrity validation (requirement #6)."""
+
+    def test_content_hash_changes_when_body_changes(self) -> None:
+        self.write_document(body=BODY)
+        first_hash = self.load().documents[0].content_hash
+
+        self.write_document(body=BODY.replace("documentation concept", "updated concept"))
+        second_hash = self.load().documents[0].content_hash
+
+        self.assertNotEqual(first_hash, second_hash)
+
+    def test_content_hash_is_stable_for_identical_content(self) -> None:
+        self.write_document(body=BODY)
+        first_hash = self.load().documents[0].content_hash
+
+        # Reload the same files
+        second_hash = self.load().documents[0].content_hash
+
+        self.assertEqual(first_hash, second_hash)
+
+
+class RecoveryTests(CorpusTestCase):
+    """Tests for safe recovery guarantees (requirement #9)."""
+
+    def test_successful_rebuild_replaces_index(self) -> None:
+        self.write_document()
+        from backend.agent.rag.bm25 import Bm25Index
+
+        index = Bm25Index(self.load())
+        first_version = index.index_version
+
+        # Modify document and rebuild
+        self.write_document(body=BODY.replace("documentation concept", "updated concept"))
+        bundle = load_corpus_with_recovery(index, self.root)
+
+        self.assertNotEqual(index.index_version, first_version)
+        self.assertEqual(bundle.index_version, index.index_version)
+
+    def test_failed_rebuild_preserves_previous_index(self) -> None:
+        self.write_document()
+        from backend.agent.rag.bm25 import Bm25Index
+
+        index = Bm25Index(self.load())
+        first_version = index.index_version
+
+        # Corrupt a document - load should fail
+        self.write_document(title=None)
+
+        with self.assertRaises(RagCorpusError):
+            load_corpus_with_recovery(index, self.root)
+
+        # Index should be unchanged
+        self.assertEqual(index.index_version, first_version)
+
+    def test_load_corpus_from_dir_is_all_or_nothing(self) -> None:
+        self.write_document("erp_docs", "good-doc")
+        self.write_document("schema", "bad-doc", title=None)
+
+        with self.assertRaises(RagCorpusError) as context:
+            load_corpus_from_dir(self.root)
+        self.assertEqual(context.exception.details.get("rule"), "metadata")
 
 
 if __name__ == "__main__":

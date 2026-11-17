@@ -73,6 +73,10 @@ STOPWORDS = frozenset(
         "just",
         "may",
         "me",
+        "mean",
+        "means",
+        "meant",
+        "meaning",
         "might",
         "more",
         "most",
@@ -158,6 +162,55 @@ _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
 # Endings that are already singular despite ending in "s".
 _NON_PLURAL_ENDINGS = ("as", "is", "os", "ss", "us")
 
+# Irregular plural forms that conservative suffix rules would corrupt.
+_IRREGULAR_PLURALS = {
+    "statuses": "status",
+    "analyses": "analysis",
+    "axes": "axis",
+    "indices": "index",
+    "matrices": "matrix",
+    "buses": "bus",
+    "viruses": "virus",
+    "theses": "thesis",
+    "crises": "crisis",
+    "phenomena": "phenomenon",
+    "criteria": "criterion",
+    "datums": "datum",
+    "media": "medium",
+    "appendices": "appendix",
+}
+
+# Query expansion mappings: a term maps to its documented expansion forms.
+# Kept small and curated to avoid precision drift; expansion is opt-in in BM25.
+QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "dispatched": ("dispatch",),
+    "dispatch": ("dispatched",),
+    "confirmed": ("confirm",),
+    "confirm": ("confirmed",),
+    "created": ("create",),
+    "create": ("created",),
+    "adjusted": ("adjust",),
+    "adjust": ("adjusted",),
+    "adjustment": ("adjust",),
+    "received": ("receive", "receipt"),
+    "receive": ("received",),
+    "receipt": ("received",),
+    "ordered": ("order",),
+    "order": ("ordered",),
+    "approved": ("approve",),
+    "approve": ("approved",),
+    "cancelled": ("cancel",),
+    "cancel": ("cancelled",),
+    "items": ("item",),
+    "item": ("items",),
+    "stocks": ("stock",),
+    "stock": ("stocks",),
+    "delivered": ("delivery",),
+    "delivery": ("delivered",),
+    "variants": ("variant",),
+    "variant": ("variants",),
+}
+
 
 def _fold(text: str) -> str:
     """NFC/NFKD fold to lowercase ASCII letters and digits only."""
@@ -192,8 +245,12 @@ def _singularize(token: str) -> str:
     ``-ies`` and ``-es`` rules cover the domain vocabulary that matters here
     (``categories``, ``dispatches``, ``classes``). Plain ``-s`` is stripped
     only when the token does not already end like a singular word.
+    Irregular forms are mapped explicitly to avoid producing invalid stems
+    such as ``statuse`` from ``statuses``.
     """
 
+    if token in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[token]
     if len(token) > 4 and token.endswith("ies"):
         return token[:-3] + "y"
     if len(token) > 5 and token.endswith(("ches", "shes", "sses", "xes", "zes")):
@@ -246,4 +303,48 @@ __all__ = [
     "normalize",
     "slugify",
     "tokenize",
+    "QUERY_EXPANSIONS",
+    "expand_query_terms",
+    "expansion_trace",
 ]
+
+
+def expand_query_terms(tokens: list[str]) -> list[str]:
+    """Return deterministic query terms with curated expansions appended.
+
+    Original tokens are always kept in order; expansion terms are appended in
+    first-occurrence order without duplicates. No index or corpus mutation is
+    performed. Pure and deterministic.
+    """
+
+    expanded: list[str] = list(tokens)
+    seen: set[str] = set(expanded)
+    for token in tokens:
+        for expansion in QUERY_EXPANSIONS.get(token, ()):
+            if expansion not in seen:
+                expanded.append(expansion)
+                seen.add(expansion)
+    return expanded
+
+
+def expansion_trace(tokens: list[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return curated expansion pairs for ``tokens`` without mutating input.
+
+    Each entry is ``(source_term, added_terms)`` where ``added_terms`` are the
+    curated expansions for ``source_term`` that were not already present in the
+    original token list, in first-occurrence order. Returns an empty tuple when
+    no expansions apply. Pure and deterministic.
+    """
+
+    seen: set[str] = set(tokens)
+    pairs: list[tuple[str, tuple[str, ...]]] = []
+    for token in tokens:
+        additions = [
+            expansion
+            for expansion in QUERY_EXPANSIONS.get(token, ())
+            if expansion not in seen
+        ]
+        if additions:
+            pairs.append((token, tuple(additions)))
+            seen.update(additions)
+    return tuple(pairs)

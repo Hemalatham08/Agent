@@ -1,8 +1,10 @@
 
+import os
+
 from ollama import chat
 
 response = chat(
-    model="llama3.2",
+    model=os.getenv("OLLAMA_MODEL", "llama3.2"),
     messages=[
         {
             "role": "user",

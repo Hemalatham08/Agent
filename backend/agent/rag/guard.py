@@ -280,7 +280,7 @@ _DOC_PATTERNS: tuple[tuple[Category, str, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:schemas?|table structure|data model|entity relationship|"
             r"primary key|foreign key|database tables?|table definitions?|"
-            r"column definitions?|columns?|fields?)\b"
+            r"column definitions?|columns?|fields?|\btables?\b)\b"
         ),
     ),
     (
@@ -288,7 +288,11 @@ _DOC_PATTERNS: tuple[tuple[Category, str, re.Pattern[str]], ...] = (
         "workflow_terms",
         re.compile(
             r"\b(?:workflows?|process(?:es)?|procedures?|steps?|lifecycle|"
-            r"sequence of (?:steps|events)|how (?:does|do) .{0,60} work)\b"
+            r"sequence of (?:steps|events)|how (?:does|do) .{0,60} work|"
+            r"what happens (?:after|when|before|next)|what comes next|"
+            r"after .{0,40} (?:is|are|was|were) (?:confirmed|approved|posted|"
+            r"created|dispatched|completed)|who (?:approves|owns|is responsible"
+            r" for|handles|authorizes)|responsible for)\b"
         ),
     ),
     (
@@ -322,6 +326,16 @@ _DOC_PATTERNS: tuple[tuple[Category, str, re.Pattern[str]], ...] = (
 _DOCS_OBJECT = re.compile(
     r"\b(?:documentation|docs|doc|knowledge base|guides?|manual|articles?|"
     r"pages?|reference)\b"
+)
+
+# Curated documentation-reference phrases taken directly from the corpus
+# front-matter aliases. These are unambiguously documentation concepts, not
+# live ERP data requests. Checked only after all live-fact indicators have
+# been exhausted, so live-data signals always take precedence.
+_DOC_REFERENCE = re.compile(
+    r"\b(?:item master|product master|database schema|erp overview|"
+    r"procurement workflow|order fulfilment|delivery workflow|"
+    r"live data policy|documentation policy)\b"
 )
 _WEAK_FRAME = re.compile(r"\b(?:what is|what are|what s|tell me about)\b")
 _CONCEPT_TERM = re.compile(
@@ -557,6 +571,29 @@ def classify_query(query: str) -> GuardDecision:
                 suggested_category=doc_category,
                 signals=_dedupe_signals(emitted),
             )
+        if (
+            doc_category == "business_definitions"
+            and hard_markers <= {"listing"}
+            and "which" in text
+        ):
+            return GuardDecision(
+                verdict=GuardVerdict.ALLOWED,
+                reason=GuardReason.DOCUMENTATION_INTENT,
+                suggested_category=doc_category,
+                signals=_dedupe_signals(emitted),
+            )
+        if (
+            _DOCS_OBJECT.search(text)
+            and doc_category is not None
+            and hard_markers <= {"temporal"}
+            and not (hard_markers & {"record", "count", "money", "status"})
+        ):
+            return GuardDecision(
+                verdict=GuardVerdict.ALLOWED,
+                reason=GuardReason.DOCUMENTATION_INTENT,
+                suggested_category=doc_category,
+                signals=_dedupe_signals(emitted),
+            )
         if doc_category is not None:
             return GuardDecision(
                 verdict=GuardVerdict.AMBIGUOUS,
@@ -589,6 +626,14 @@ def classify_query(query: str) -> GuardDecision:
             reason=GuardReason.LIVE_FACT_REQUEST,
             live_fact_kind=live_kind,
             guidance=GUIDANCE_BY_KIND[live_kind],
+            signals=_dedupe_signals(emitted),
+        )
+
+    if _DOC_REFERENCE.search(text):
+        return GuardDecision(
+            verdict=GuardVerdict.ALLOWED,
+            reason=GuardReason.DOCUMENTATION_INTENT,
+            suggested_category="erp_docs",
             signals=_dedupe_signals(emitted),
         )
 

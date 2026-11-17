@@ -23,6 +23,8 @@ from backend.agent.rag import (
     slugify,
     tokenize,
 )
+from backend.agent.rag.chunking import chunk_document
+from backend.agent.rag.retriever import match_centered_snippet
 
 
 def make_document(
@@ -630,6 +632,141 @@ class SnippetTests(unittest.TestCase):
         self.assertLessEqual(result.total_chars, 500)
         for hit in result.hits:
             self.assertLessEqual(len(hit.snippet), 200)
+
+
+class MatchCenteredSnippetTests(unittest.TestCase):
+    """Tests for match_centered_snippet: sentence-span scoring,
+    match-centered windowing, expansion, limits, and fallback."""
+
+    def test_sentence_with_match_is_centered(self) -> None:
+        text = (
+            "Intro sentence that is irrelevant. "
+            "The target sentence contains the query term alpha here. "
+            "Another trailing sentence with no matches at all."
+        )
+        snippet = match_centered_snippet(text, ["alpha"], 200)
+        self.assertIn("alpha", snippet)
+        self.assertLessEqual(len(snippet), 200)
+
+    def test_match_at_end_of_chunk_is_centered(self) -> None:
+        text = (
+            "Leading filler text with no matches. "
+            "More filler. "
+            "The final sentence has the alpha term at the end."
+        )
+        snippet = match_centered_snippet(text, ["alpha"], 200)
+        self.assertIn("alpha", snippet)
+        self.assertLessEqual(len(snippet), 200)
+
+    def test_zero_match_falls_back_to_head(self) -> None:
+        text = (
+            "First sentence with no query terms. "
+            "Second sentence also lacks them. "
+            "Third sentence still no matches."
+        )
+        snippet = match_centered_snippet(text, ["zzznomatch"], 200)
+        # Should fall back to bounded_snippet (head of chunk)
+        self.assertTrue(snippet.startswith("First sentence"))
+
+    def test_multiple_matching_sentences_are_included(self) -> None:
+        text = (
+            "Intro filler. "
+            "Sentence one has alpha and beta. "
+            "Connector sentence without terms. "
+            "Sentence two has beta and gamma. "
+            "Trailing filler."
+        )
+        snippet = match_centered_snippet(text, ["alpha", "beta", "gamma"], 500)
+        self.assertIn("alpha", snippet)
+        self.assertIn("beta", snippet)
+        self.assertIn("gamma", snippet)
+
+    def test_ties_resolve_to_earliest_sentence(self) -> None:
+        text = (
+            "First sentence with alpha term here. "
+            "Middle filler sentence. "
+            "Third sentence with alpha term here too."
+        )
+        snippet = match_centered_snippet(text, ["alpha"], 200)
+        # Best score tie between sentence 0 and sentence 2; earliest wins
+        self.assertTrue(snippet.startswith("First sentence"))
+
+    def test_empty_text_returns_empty(self) -> None:
+        self.assertEqual(match_centered_snippet("", ["alpha"], 100), "")
+
+    def test_empty_query_tokens_falls_back_to_head(self) -> None:
+        text = "First sentence. Second sentence with alpha. Third sentence."
+        snippet = match_centered_snippet(text, [], 100)
+        self.assertTrue(snippet.startswith("First sentence"))
+
+    def test_limit_is_respected(self) -> None:
+        text = (
+            "Alpha sentence one. " + "filler " * 100 + " Alpha sentence two."
+        )
+        snippet = match_centered_snippet(text, ["alpha"], 50)
+        self.assertLessEqual(len(snippet), 50)
+
+    def test_short_text_is_returned_as_is(self) -> None:
+        text = "Short text with alpha."
+        snippet = match_centered_snippet(text, ["alpha"], 700)
+        self.assertEqual(snippet, text)
+
+    def test_invalid_limit_is_rejected(self) -> None:
+        for limit in (0, -1, True, "100", 1.5):
+            with self.subTest(limit=repr(limit)):
+                with self.assertRaises(ValueError):
+                    match_centered_snippet("text", ["alpha"], limit)  # type: ignore[arg-type]
+
+    def test_invalid_text_is_rejected(self) -> None:
+        with self.assertRaises(TypeError):
+            match_centered_snippet(None, ["alpha"], 100)  # type: ignore[arg-type]
+
+    def test_list_items_are_preserved(self) -> None:
+        text = (
+            "Intro paragraph. "
+            "- Item one with alpha keyword. "
+            "- Item two with beta keyword. "
+            "- Item three with no keywords. "
+            "Outro paragraph."
+        )
+        snippet = match_centered_snippet(text, ["alpha", "beta"], 300)
+        self.assertIn("alpha", snippet)
+        self.assertIn("beta", snippet)
+
+    def test_retriever_uses_match_centered_snippets(self) -> None:
+        """End-to-end: retriever snippets contain query terms when possible."""
+        body = (
+            "Preamble about the system. "
+            "The free stock calculation is on_hand_qty minus reserved_qty. "
+            "This formula is used across all warehouse modules. "
+            "Reserved stock is committed to open sales orders. "
+            "Free stock may be negative when reservations exceed on-hand."
+        )
+        doc = KnowledgeDocument(
+            doc_id="free-stock-detail",
+            title="Free Stock Detail",
+            category="business_definitions",
+            fact_kind="definition",
+            version="1.0.0",
+            updated_at=date(2026, 11, 1),
+            summary="Free stock calculation details.",
+            tags=(),
+            aliases=(),
+            source_path="business_definitions/free-stock-detail.md",
+            content_hash="b" * 64,
+            body=body,
+        )
+        index = make_index(chunk_document(doc))
+        retriever = DocumentationRetriever(index, max_snippet_chars=200)
+        result = retriever.retrieve("free stock calculation", top_k=3)
+
+        self.assertEqual(result.status, "ok")
+        # At least one hit should contain the query terms in its snippet
+        found_term = any(
+            "calculation" in hit.snippet or "formula" in hit.snippet
+            for hit in result.hits
+        )
+        self.assertTrue(found_term, f"No snippet contained query terms: {[h.snippet for h in result.hits]}")
 
 
 class CategoryTests(unittest.TestCase):

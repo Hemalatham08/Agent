@@ -41,8 +41,9 @@ from dataclasses import dataclass
 
 from backend.agent.rag.chunking import searchable_text
 from backend.agent.rag.config import BM25_B, BM25_K1, MAX_BM25_K1
+from backend.agent.rag.diagnostics import DetailedScoredChunk, TermContribution
 from backend.agent.rag.models import Category, CorpusBundle, KnowledgeChunk
-from backend.agent.rag.text import tokenize
+from backend.agent.rag.text import expand_query_terms, tokenize
 
 
 @dataclass(frozen=True)
@@ -228,11 +229,15 @@ class Bm25Index:
         *,
         category: Category | None = None,
         limit: int | None = None,
+        expand_query: bool = False,
     ) -> tuple[ScoredChunk, ...]:
         """Rank chunks for ``query``.
 
         ``category`` restricts candidates without changing corpus statistics.
         ``limit`` truncates the ranked list; ``None`` returns every match.
+        When ``expand_query`` is true, curated query-term expansions are added
+        to the scoring terms (additive only; original tokens are always kept).
+        Default ``False`` preserves legacy scoring exactly.
         """
 
         if not isinstance(query, str):
@@ -240,6 +245,8 @@ class Bm25Index:
         limit_value = _validate_limit(limit)
 
         tokens = tokenize(query)
+        if expand_query:
+            tokens = expand_query_terms(tokens)
         state = self._snapshot()
         if not tokens or not state.chunks or state.average_length <= 0.0:
             return ()
@@ -251,22 +258,13 @@ class Bm25Index:
                 return ()
             allowed = frozenset(positions)
 
+        index_contributions = self._score_terms(state, tokens, allowed)
         scores: dict[int, float] = {}
-        for term in dict.fromkeys(tokens):
-            postings = state.postings.get(term)
-            if not postings:
-                continue
-            idf = _idf(len(state.chunks), len(postings))
-            for index, frequency in postings:
-                if allowed is not None and index not in allowed:
-                    continue
-                length = state.doc_lengths[index]
-                denominator = frequency + self._k1 * (
-                    1.0 - self._b + self._b * length / state.average_length
-                )
-                scores[index] = scores.get(index, 0.0) + (
-                    idf * (frequency * (self._k1 + 1.0)) / denominator
-                )
+        for index, contribs in index_contributions.items():
+            total = 0.0
+            for value in contribs.values():
+                total += value
+            scores[index] = total
 
         if not scores:
             return ()
@@ -280,6 +278,142 @@ class Bm25Index:
         return tuple(
             ScoredChunk(chunk=chunk, score=score) for chunk, score in ranked
         )
+
+    def search_detailed(
+        self,
+        query: str,
+        *,
+        category: Category | None = None,
+        limit: int | None = None,
+        expand_query: bool = False,
+    ) -> tuple[DetailedScoredChunk, ...]:
+        """Rank chunks for ``query`` with per-term score contributions.
+
+        Identical to :meth:`search` in scoring, ranking, tie-breaking, and
+        category filtering; each returned chunk also carries the per-term
+        contribution that produced its total score. Used only by diagnostics
+        (opt-in).
+        """
+
+        if not isinstance(query, str):
+            raise TypeError("query must be a string")
+        limit_value = _validate_limit(limit)
+
+        tokens = tokenize(query)
+        if expand_query:
+            tokens = expand_query_terms(tokens)
+        state = self._snapshot()
+        if not tokens or not state.chunks or state.average_length <= 0.0:
+            return ()
+
+        allowed: frozenset[int] | None = None
+        if category is not None:
+            positions = state.documents_by_category.get(category, ())
+            if not positions:
+                return ()
+            allowed = frozenset(positions)
+
+        index_contributions = self._score_terms(state, tokens, allowed)
+        if not index_contributions:
+            return ()
+
+        num_chunks = len(state.chunks)
+        detailed: list[DetailedScoredChunk] = []
+        for index, contribs in index_contributions.items():
+            total = 0.0
+            for value in contribs.values():
+                total += value
+            term_contributions: list[TermContribution] = []
+            for term in contribs:
+                postings = state.postings.get(term, ())
+                document_frequency = len(postings)
+                frequency = 0
+                for position, freq in postings:
+                    if position == index:
+                        frequency = freq
+                        break
+                term_contributions.append(
+                    TermContribution(
+                        term=term,
+                        term_frequency=frequency,
+                        document_frequency=document_frequency,
+                        idf=_idf(num_chunks, document_frequency),
+                        contribution=contribs[term],
+                    )
+                )
+            detailed.append(
+                DetailedScoredChunk(
+                    chunk=state.chunks[index],
+                    score=total,
+                    contributions=tuple(term_contributions),
+                )
+            )
+
+        detailed.sort(key=lambda item: (-item.score, item.chunk.chunk_id))
+        if limit_value is not None:
+            detailed = detailed[:limit_value]
+        return tuple(detailed)
+
+    def _score_terms(
+        self,
+        state: _IndexState,
+        tokens: list[str],
+        allowed: frozenset[int] | None,
+    ) -> dict[int, dict[str, float]]:
+        """Return per-chunk, per-term BM25 contributions.
+
+        The inner dict preserves term order, so summing its values in order
+        reproduces :meth:`search` totals bit-for-bit.
+        """
+
+        contributions: dict[int, dict[str, float]] = {}
+        num_chunks = len(state.chunks)
+        for term in dict.fromkeys(tokens):
+            postings = state.postings.get(term)
+            if not postings:
+                continue
+            idf = _idf(num_chunks, len(postings))
+            for index, frequency in postings:
+                if allowed is not None and index not in allowed:
+                    continue
+                length = state.doc_lengths[index]
+                denominator = frequency + self._k1 * (
+                    1.0 - self._b + self._b * length / state.average_length
+                )
+                contribution = idf * (frequency * (self._k1 + 1.0)) / denominator
+                per_index = contributions.setdefault(index, {})
+                per_index[term] = per_index.get(term, 0.0) + contribution
+        return contributions
+
+    @property
+    def k1(self) -> float:
+        """BM25 ``k1`` parameter."""
+        return self._k1
+
+    @property
+    def b(self) -> float:
+        """BM25 ``b`` parameter."""
+        return self._b
+
+    def vocabulary_size(self) -> int:
+        """Return the number of distinct indexed terms."""
+        with self._lock:
+            return len(self._state.postings)
+
+    def total_tokens(self) -> int:
+        """Return the total number of indexed tokens across all chunks."""
+        with self._lock:
+            return sum(self._state.doc_lengths)
+
+    def category_counts(self) -> tuple[tuple[str, int], ...]:
+        """Return ``(category, chunk_count)`` pairs, sorted by category."""
+        with self._lock:
+            return tuple(
+                sorted(
+                    (category, len(positions))
+                    for category, positions in self._state.documents_by_category.items()
+                )
+            )
 
     def rebuild(self, bundle: CorpusBundle) -> None:
         """Atomically replace the indexed corpus."""

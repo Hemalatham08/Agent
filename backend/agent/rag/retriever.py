@@ -19,7 +19,9 @@ filesystem, network, database, or LLM access occurs.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 
 from backend.agent.rag.bm25 import Bm25Index, ScoredChunk
 from backend.agent.rag.config import (
@@ -35,6 +37,18 @@ from backend.agent.rag.config import (
     RELATIVE_SCORE_FLOOR,
 )
 from backend.agent.rag.corpus import CATEGORIES
+from backend.agent.rag.diagnostics import (
+    DiagnosedRetrieval,
+    DetailedScoredChunk,
+    ExpansionTrace,
+    GuardTrace,
+    HitExplanation,
+    RetrievalTrace,
+    TermContribution,
+    build_index_stats,
+    build_corpus_health,
+    redacted_trace_fields,
+)
 from backend.agent.rag.errors import (
     RagConfigurationError,
     RagInvalidArgumentsError,
@@ -49,6 +63,7 @@ from backend.agent.rag.models import (
     RetrievalQuery,
     RetrievalResult,
 )
+from backend.agent.rag.text import expansion_trace, tokenize
 
 NO_MATCH_GUIDANCE = (
     "No reviewed documentation matched this question closely enough. Rephrase "
@@ -101,6 +116,122 @@ def _preferred_snippet_cut(head: str) -> int:
     if index >= minimum:
         return index
     return len(head)
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    """Split text into sentence spans, preserving order.
+
+    Splits first on double newlines (paragraphs), then on sentence-ending
+    punctuation followed by whitespace. Lists, tables, and headings are
+    treated as sentence-like spans so they are never silently discarded.
+    """
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    sentences: list[str] = []
+    for para in paragraphs:
+        parts = re.split(r"(?<=[.!?])\s+", para)
+        for part in parts:
+            part = part.strip()
+            if part:
+                sentences.append(part)
+    return sentences
+
+
+def match_centered_snippet(
+    text: str, query_tokens: list[str], limit: int
+) -> str:
+    """Return a snippet of at most ``limit`` characters centered on matches.
+
+    Unlike :func:`bounded_snippet`, which always starts at the head of the
+    chunk, this function:
+
+    1. Splits ``text`` into sentence spans.
+    2. Scores each span by how many query tokens it contains.
+    3. Selects the highest-scoring span (ties resolved to the earliest index).
+    4. Expands the window to include adjacent matching spans, then fills the
+       remaining budget with neighboring spans.
+    5. Falls back to :func:`bounded_snippet` when no span contains a query
+       term.
+
+    The result is deterministic and always clamps to ``limit`` characters.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    if not query_tokens:
+        return bounded_snippet(text, limit)
+
+    sentences = _split_into_sentences(text)
+    if not sentences:
+        return bounded_snippet(text, limit)
+
+    # Score each sentence by query-token overlap.
+    qt = set(query_tokens)
+    scores = [len(qt & set(tokenize(s))) for s in sentences]
+
+    # No match anywhere: fall back to head-of-chunk behavior.
+    if max(scores) == 0:
+        return bounded_snippet(text, limit)
+
+    # Best sentence: highest score, ties resolved to earliest index.
+    best_idx = max(range(len(scores)), key=lambda i: (scores[i], -i))
+
+    # Build a contiguous window of matching sentences around the best one.
+    window_indices: set[int] = {best_idx}
+    changed = True
+    while changed:
+        changed = False
+        for idx in list(window_indices):
+            for neighbor in (idx - 1, idx + 1):
+                if (
+                    0 <= neighbor < len(sentences)
+                    and neighbor not in window_indices
+                    and scores[neighbor] > 0
+                ):
+                    window_indices.add(neighbor)
+                    changed = True
+
+    # Expand outward to fill the remaining budget, preferring matching
+    # neighbors, then filling right, then left (deterministic order).
+    left = min(window_indices) - 1
+    right = max(window_indices) + 1
+
+    def build(indices: set[int]) -> str:
+        return " ".join(sentences[i] for i in sorted(indices))
+
+    while left >= 0 or right < len(sentences):
+        if len(build(window_indices)) >= limit - 3:
+            break
+        added = False
+        if right < len(sentences) and scores[right] > 0:
+            window_indices.add(right)
+            right += 1
+            added = True
+        elif left >= 0 and scores[left] > 0:
+            window_indices.add(left)
+            left -= 1
+            added = True
+        elif right < len(sentences):
+            window_indices.add(right)
+            right += 1
+            added = True
+        elif left >= 0:
+            window_indices.add(left)
+            left -= 1
+            added = True
+        if not added:
+            break
+
+    result = build(window_indices)
+    return bounded_snippet(result, limit)
 
 
 def bounded_snippet(text: str, limit: int) -> str:
@@ -160,6 +291,8 @@ class DocumentationRetriever:
         max_hits_per_doc: int = DEFAULT_MAX_HITS_PER_DOC,
         max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS,
         max_total_chars: int = DEFAULT_MAX_TOTAL_CHARS,
+        query_expansion: bool = False,
+        diagnostic_sink: object = None,
     ) -> None:
         if not isinstance(index, Bm25Index):
             raise RagInvalidArgumentsError(
@@ -192,6 +325,12 @@ class DocumentationRetriever:
             1,
             MAX_TOTAL_CHARS,
         )
+        self._query_expansion = bool(query_expansion)
+        if diagnostic_sink is not None and not callable(diagnostic_sink):
+            raise RagInvalidArgumentsError(
+                "diagnostic_sink", "diagnostic_sink must be callable or None"
+            )
+        self._diagnostic_sink = diagnostic_sink
 
     @property
     def index(self) -> Bm25Index:
@@ -212,6 +351,71 @@ class DocumentationRetriever:
         ambiguous questions never search the index.
         """
 
+        result, _trace = self._retrieve_core(
+            request,
+            category,
+            top_k,
+            include_diagnostics=False,
+        )
+        return result
+
+    def retrieve_with_diagnostics(
+        self,
+        request: RetrievalQuery | str,
+        *,
+        category: str | None = None,
+        top_k: int | None = None,
+        include_query_fingerprint: bool = False,
+        include_detailed_scoring: bool = False,
+    ) -> DiagnosedRetrieval:
+        """Run the guard and retrieval, returning the result plus a trace.
+
+        The returned ``result`` is identical to :meth:`retrieve` for the same
+        arguments. The ``trace`` contains guard, expansion, selection, and
+        per-hit explanation details. No raw query text, snippet, body, or
+        guidance text is included unless a query fingerprint is explicitly
+        requested. Detailed per-term score contributions require
+        ``include_detailed_scoring=True``.
+
+        A diagnostic sink, if configured in the constructor, is invoked with
+        the trace; a failing sink never corrupts the result.
+        """
+
+        result, trace = self._retrieve_core(
+            request,
+            category,
+            top_k,
+            include_diagnostics=True,
+            include_query_fingerprint=include_query_fingerprint,
+            include_detailed_scoring=include_detailed_scoring,
+        )
+        assert trace is not None
+        if self._diagnostic_sink is not None:
+            # A diagnostic sink must never corrupt a retrieval result.
+            try:
+                self._diagnostic_sink(trace)
+            except Exception:
+                pass
+        return DiagnosedRetrieval(result=result, trace=trace)
+
+    def _retrieve_core(
+        self,
+        request: RetrievalQuery | str,
+        category: str | None,
+        top_k: int | None,
+        *,
+        include_diagnostics: bool,
+        include_query_fingerprint: bool = False,
+        include_detailed_scoring: bool = False,
+    ) -> tuple[RetrievalResult, RetrievalTrace | None]:
+        """Shared retrieval core used by ``retrieve`` and diagnostics.
+
+        ``retrieve`` passes ``include_diagnostics=False`` so the normal path
+        allocates nothing diagnostic and is byte-for-byte equivalent to the
+        pre-Phase-5 implementation.
+        """
+
+        # --- argument validation (identical to the public retrieve contract) ---
         if isinstance(request, RetrievalQuery):
             query_text = request.query
             resolved_category = (
@@ -251,15 +455,44 @@ class DocumentationRetriever:
                 f"top_k must be an integer between 1 and {MAX_TOP_K}",
             )
 
-        decision = classify_query(query_text)
-        query_text = query_text.strip()
+        # --- diagnostics inputs (query tokens are needed for snippets even
+        # on the normal path, so they are always computed) ---
+        query_text_stripped = query_text.strip()
+        query_tokens = tokenize(query_text_stripped)
+        query_chars = len(query_text_stripped)
+        query_fingerprint: str | None = None
+        if include_query_fingerprint:
+            query_fingerprint = hashlib.sha256(
+                query_text_stripped.encode("utf-8")
+            ).hexdigest()[:12]
+
+        decision = classify_query(query_text_stripped)
         index_version = self._index.index_version
 
+        # --- diagnostics accumulators ---
+        index_searched = False
+        guard = GuardTrace(decision)
+        expansion = ExpansionTrace(
+            enabled=self._query_expansion,
+            original_token_count=len(query_tokens) if query_tokens is not None else 0,
+            expanded_token_count=len(query_tokens) if query_tokens is not None else 0,
+        )
+        candidate_count = 0
+        best_score: float | None = None
+        threshold: float | None = None
+        dropped_below_min_score = 0
+        dropped_below_relative_floor = 0
+        dropped_duplicate_chunk = 0
+        dropped_per_document_cap = 0
+        dropped_top_k = 0
+        selected_explanations: list[HitExplanation] = []
+
+        # --- guard branch: never searches the index ---
         if decision.verdict is not GuardVerdict.ALLOWED:
             kind = decision.live_fact_kind or "listing"
             guidance = decision.guidance or GUIDANCE_BY_KIND[kind]
-            return RetrievalResult(
-                query=query_text,
+            result = RetrievalResult(
+                query=query_text_stripped,
                 status="blocked",
                 blocked_reason=kind,
                 guidance=guidance,
@@ -267,64 +500,215 @@ class DocumentationRetriever:
                 total_chars=0,
                 index_version=index_version,
             )
+        else:
+            index_searched = True
 
-        scored = self._index.search(
-            query_text,
-            category=resolved_category,  # type: ignore[arg-type]
-            limit=None,
-        )
-        if not scored:
-            return self._no_match(query_text, index_version)
-
-        best_score = scored[0].score
-        if best_score < self._min_score:
-            return self._no_match(query_text, index_version)
-
-        threshold = max(
-            self._min_score,
-            self._relative_score_floor * best_score,
-        )
-        selected = self._select(scored, threshold, resolved_top_k)
-
-        hits: list[RetrievalHit] = []
-        total_chars = 0
-        for item in selected:
-            remaining = self._max_total_chars - total_chars
-            if remaining < _MIN_SNIPPET_BUDGET:
-                break
-            snippet = bounded_snippet(
-                item.chunk.text,
-                min(self._max_snippet_chars, remaining),
-            )
-            if not snippet:
-                break
-            chunk = item.chunk
-            hits.append(
-                RetrievalHit(
-                    chunk_id=chunk.chunk_id,
-                    doc_id=chunk.doc_id,
-                    title=chunk.title,
-                    section=_section_label(chunk.section_path),
-                    category=chunk.category,
-                    fact_kind=chunk.fact_kind,
-                    score=item.score,
-                    snippet=snippet,
-                    source_path=chunk.source_path,
-                    updated_at=chunk.updated_at,
+            # Expansion trace terms (diagnostics only).
+            if include_diagnostics and self._query_expansion:
+                expanded_tokens = expand_query_terms(query_tokens)
+                expanded_pairs = expansion_trace(query_tokens)
+                expansion = ExpansionTrace(
+                    enabled=True,
+                    original_token_count=len(query_tokens),
+                    expanded_token_count=len(expanded_tokens),
+                    expansions=tuple(
+                        ExpansionEntry(source=source, added=added)
+                        for source, added in expanded_pairs
+                    ),
                 )
+
+            scored = self._index.search(
+                query_text_stripped,
+                category=resolved_category,  # type: ignore[arg-type]
+                limit=None,
+                expand_query=self._query_expansion,
             )
-            total_chars += len(snippet)
+            candidate_count = len(scored)
 
-        if not hits:
-            return self._no_match(query_text, index_version)
+            if not scored:
+                result = self._no_match(query_text_stripped, index_version)
+            else:
+                best_score = scored[0].score
+                threshold = max(
+                    self._min_score,
+                    self._relative_score_floor * best_score,
+                )
+                if best_score < self._min_score:
+                    dropped_below_min_score = candidate_count
+                    result = self._no_match(query_text_stripped, index_version)
+                else:
+                    selected_list, stats = self._select_with_stats(
+                        scored, threshold, resolved_top_k
+                    )
+                    dropped_below_min_score = stats["dropped_below_min_score"]
+                    dropped_below_relative_floor = stats[
+                        "dropped_below_relative_floor"
+                    ]
+                    dropped_duplicate_chunk = stats["dropped_duplicate_chunk"]
+                    dropped_per_document_cap = stats["dropped_per_document_cap"]
+                    dropped_top_k = stats["dropped_top_k"]
 
-        return RetrievalResult(
-            query=query_text,
-            status="ok",
-            hits=tuple(hits),
-            total_chars=total_chars,
-            index_version=index_version,
-        )
+                    # Detailed scoring (opt-in): search_detailed mirrors search
+                    # exactly but also returns per-term contributions.
+                    detailed_map: dict[str, DetailedScoredChunk] = {}
+                    if include_diagnostics and include_detailed_scoring:
+                        detailed_results = self._index.search_detailed(
+                            query_text_stripped,
+                            category=resolved_category,  # type: ignore[arg-type]
+                            limit=None,
+                            expand_query=self._query_expansion,
+                        )
+                        detailed_map = {
+                            item.chunk.chunk_id: item
+                            for item in detailed_results
+                        }
+
+                    hits: list[RetrievalHit] = []
+                    total_chars = 0
+                    for rank, item in enumerate(selected_list, start=1):
+                        remaining = self._max_total_chars - total_chars
+                        if remaining < _MIN_SNIPPET_BUDGET:
+                            dropped_top_k += len(selected_list) - rank + 1
+                            break
+                        snippet = match_centered_snippet(
+                            item.chunk.text,
+                            query_tokens,
+                            min(self._max_snippet_chars, remaining),
+                        )
+                        if not snippet:
+                            dropped_top_k += len(selected_list) - rank + 1
+                            break
+                        chunk = item.chunk
+                        hits.append(
+                            RetrievalHit(
+                                chunk_id=chunk.chunk_id,
+                                doc_id=chunk.doc_id,
+                                title=chunk.title,
+                                section=_section_label(chunk.section_path),
+                                category=chunk.category,
+                                fact_kind=chunk.fact_kind,
+                                score=item.score,
+                                snippet=snippet,
+                                source_path=chunk.source_path,
+                                updated_at=chunk.updated_at,
+                            )
+                        )
+                        total_chars += len(snippet)
+
+                        if include_diagnostics:
+                            chunk_tokens = set(tokenize(chunk.text))
+                            matched_terms = tuple(
+                                t for t in query_tokens if t in chunk_tokens
+                            )
+                            contributions: tuple[TermContribution, ...] = ()
+                            if (
+                                include_detailed_scoring
+                                and chunk.chunk_id in detailed_map
+                            ):
+                                contributions = detailed_map[
+                                    chunk.chunk_id
+                                ].contributions
+                            selected_explanations.append(
+                                HitExplanation(
+                                    rank=rank,
+                                    chunk_id=chunk.chunk_id,
+                                    doc_id=chunk.doc_id,
+                                    category=chunk.category,
+                                    score=item.score,
+                                    snippet_chars=len(snippet),
+                                    matched_terms=matched_terms,
+                                    contributions=contributions,
+                                )
+                            )
+
+                    if not hits:
+                        result = self._no_match(query_text_stripped, index_version)
+                    else:
+                        result = RetrievalResult(
+                            query=query_text_stripped,
+                            status="ok",
+                            hits=tuple(hits),
+                            total_chars=total_chars,
+                            index_version=index_version,
+                        )
+
+        # --- build the trace (diagnostics only) ---
+        trace: RetrievalTrace | None = None
+        if include_diagnostics:
+            assert query_tokens is not None
+            trace = RetrievalTrace(
+                status=result.status,
+                index_version=index_version,
+                index_searched=index_searched,
+                guard=guard,
+                expansion=expansion,
+                query_chars=query_chars,
+                query_token_count=len(query_tokens),
+                query_fingerprint=query_fingerprint,
+                candidate_count=candidate_count,
+                best_score=best_score,
+                threshold=threshold,
+                dropped_below_min_score=dropped_below_min_score,
+                dropped_below_relative_floor=dropped_below_relative_floor,
+                dropped_duplicate_chunk=dropped_duplicate_chunk,
+                dropped_per_document_cap=dropped_per_document_cap,
+                dropped_top_k=dropped_top_k,
+                selected=tuple(selected_explanations),
+                total_chars=result.total_chars,
+            )
+
+        return result, trace
+
+    def _select_with_stats(
+        self,
+        scored: tuple[ScoredChunk, ...],
+        threshold: float,
+        top_k: int,
+    ) -> tuple[list[ScoredChunk], dict[str, int]]:
+        """Select hits like :meth:`_select` while counting every drop.
+
+        The selected list is identical to :meth:`_select`; the returned stats
+        dictionary is diagnostic-only.
+        """
+
+        selected: list[ScoredChunk] = []
+        seen_chunks: set[str] = set()
+        per_document: dict[str, int] = {}
+        dropped_below_min_score = 0
+        dropped_below_relative_floor = 0
+        dropped_duplicate_chunk = 0
+        dropped_per_document_cap = 0
+        dropped_top_k = 0
+
+        for item in scored:
+            if len(selected) >= top_k:
+                dropped_top_k += 1
+                continue
+            if item.score < self._min_score:
+                dropped_below_min_score += 1
+                continue
+            if item.score < threshold:
+                dropped_below_relative_floor += 1
+                continue
+            chunk_id = item.chunk.chunk_id
+            if chunk_id in seen_chunks:
+                dropped_duplicate_chunk += 1
+                continue
+            doc_id = item.chunk.doc_id
+            if per_document.get(doc_id, 0) >= self._max_hits_per_doc:
+                dropped_per_document_cap += 1
+                continue
+            seen_chunks.add(chunk_id)
+            per_document[doc_id] = per_document.get(doc_id, 0) + 1
+            selected.append(item)
+
+        return selected, {
+            "dropped_below_min_score": dropped_below_min_score,
+            "dropped_below_relative_floor": dropped_below_relative_floor,
+            "dropped_duplicate_chunk": dropped_duplicate_chunk,
+            "dropped_per_document_cap": dropped_per_document_cap,
+            "dropped_top_k": dropped_top_k,
+        }
 
     def _select(
         self,
@@ -332,25 +716,7 @@ class DocumentationRetriever:
         threshold: float,
         top_k: int,
     ) -> list[ScoredChunk]:
-        selected: list[ScoredChunk] = []
-        seen_chunks: set[str] = set()
-        per_document: dict[str, int] = {}
-
-        for item in scored:
-            if item.score < threshold:
-                break
-            chunk_id = item.chunk.chunk_id
-            if chunk_id in seen_chunks:
-                continue
-            doc_id = item.chunk.doc_id
-            if per_document.get(doc_id, 0) >= self._max_hits_per_doc:
-                continue
-            seen_chunks.add(chunk_id)
-            per_document[doc_id] = per_document.get(doc_id, 0) + 1
-            selected.append(item)
-            if len(selected) >= top_k:
-                break
-
+        selected, _stats = self._select_with_stats(scored, threshold, top_k)
         return selected
 
     @staticmethod
