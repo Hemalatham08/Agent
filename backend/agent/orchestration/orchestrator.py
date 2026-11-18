@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from backend.agent.erp.runner import ErpToolRunner
-from backend.agent.llm.client import OllamaClient
+from backend.agent.llm.base import LlmClient
 from backend.agent.llm.errors import (
     LlmConnectionError,
     LlmError,
@@ -480,7 +480,7 @@ class AgentOrchestrator:
     def __init__(
         self,
         *,
-        client: OllamaClient,
+        client: LlmClient,
         runner: ErpToolRunner,
         registry: ToolRegistry,
         max_tool_calls: int = 5,
@@ -515,13 +515,24 @@ class AgentOrchestrator:
         try:
             self.client.validate_availability()
         except LlmConnectionError as err:
+            provider_label = getattr(self.client, "provider_label", "Ollama")
+            connection_hint = getattr(
+                self.client,
+                "connection_hint",
+                "Please ensure Ollama is installed and running (`ollama serve`).",
+            )
+            unavailable_error = getattr(
+                self.client,
+                "unavailable_error_code",
+                "ollama_unavailable",
+            )
             return AgentExecutionResult(
                 answer=(
-                    f"The AI assistant is currently unable to reach the local Ollama service "
-                    f"at '{self.client.config.base_url}'. Please ensure Ollama is installed and running (`ollama serve`)."
+                    f"The AI assistant is currently unable to reach the local {provider_label} service "
+                    f"at '{self.client.config.base_url}'. {connection_hint}"
                 ),
                 status="error",
-                error="ollama_unavailable",
+                error=unavailable_error,
                 session_id=session_id,
             )
         except LlmModelNotFoundError as err:
@@ -704,6 +715,11 @@ class AgentOrchestrator:
                     status=result.status.value,
                     duration_ms=result.duration_ms,
                     error=result.error.message if result.error else None,
+                    output=(
+                        result.output
+                        if result.status is ToolExecutionStatus.SUCCEEDED
+                        else None
+                    ),
                 )
                 executed_summaries.append(summary)
 

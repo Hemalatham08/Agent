@@ -5,7 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ToolCallSummary(BaseModel):
-    """Safe, high-level summary of an executed tool call."""
+    """Safe, high-level summary of an executed tool call.
+
+    ``output`` carries the read-only ERP records returned by a successful tool
+    so API clients can present the same grounded data that the agent used.
+    Failed or cancelled calls never include records.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -14,6 +19,7 @@ class ToolCallSummary(BaseModel):
     status: str  # "succeeded" | "failed" | "cancelled"
     duration_ms: float | None = None
     error: str | None = None
+    output: Any | None = None
 
 
 class AgentExecutionResult(BaseModel):

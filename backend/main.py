@@ -13,7 +13,9 @@ logging.basicConfig(
 )
 
 from backend.agent.erp.platform import ErpToolPlatform
+from backend.agent.llm.ai_models_api import register_ai_model_routes
 from backend.agent.services.agent_service import AgentService
+from backend.agent.services.ai_model_manager import RuntimeAiModelManager
 from backend.tools.database import (
     get_all_products,
     get_product_by_id,
@@ -31,29 +33,38 @@ from backend.tools.database import (
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     platform: ErpToolPlatform | None = None
+    manager: RuntimeAiModelManager | None = None
     agent_service: AgentService | None = None
     app.state.erp_tools = None
     app.state.erp_runner = None
     app.state.agent_service = None
+    app.state.ai_model_manager = None
     try:
         platform = ErpToolPlatform.from_env()
-        agent_service = AgentService.from_platform(platform)
+        manager = RuntimeAiModelManager(platform)
+        agent_service = manager.agent_service
         app.state.erp_tools = platform
         app.state.erp_runner = platform.runner
         app.state.agent_service = agent_service
+        app.state.ai_model_manager = manager
         yield
     finally:
         try:
-            if agent_service is not None:
-                agent_service.close()
+            if manager is not None:
+                manager.close()
         finally:
             try:
-                if platform is not None:
-                    platform.close()
+                if agent_service is not None:
+                    agent_service.close()
             finally:
-                app.state.erp_tools = None
-                app.state.erp_runner = None
-                app.state.agent_service = None
+                try:
+                    if platform is not None:
+                        platform.close()
+                finally:
+                    app.state.erp_tools = None
+                    app.state.erp_runner = None
+                    app.state.agent_service = None
+                    app.state.ai_model_manager = None
 
 
 # Create the FastAPI application
@@ -73,6 +84,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+register_ai_model_routes(app)
 
 # Home endpoint
 @app.get("/")
@@ -170,6 +182,8 @@ class ToolCallSummaryResponse(BaseModel):
     status: str
     duration_ms: float | None = None
     error: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    output: Any | None = None
 
 
 class ChatResponse(BaseModel):
@@ -189,12 +203,19 @@ def chat_endpoint(request: ChatRequest, req: Request):
 
     agent_service: AgentService | None = getattr(req.app.state, "agent_service", None)
     if agent_service is None:
-        platform: ErpToolPlatform | None = getattr(req.app.state, "erp_tools", None)
-        if platform is not None:
-            agent_service = AgentService.from_platform(platform)
+        manager: RuntimeAiModelManager | None = getattr(
+            req.app.state, "ai_model_manager", None
+        )
+        if isinstance(manager, RuntimeAiModelManager):
+            agent_service = manager.agent_service
             req.app.state.agent_service = agent_service
         else:
-            raise HTTPException(status_code=503, detail="Agent service is not available.")
+            platform: ErpToolPlatform | None = getattr(req.app.state, "erp_tools", None)
+            if platform is not None:
+                agent_service = AgentService.from_platform(platform)
+                req.app.state.agent_service = agent_service
+            else:
+                raise HTTPException(status_code=503, detail="Agent service is not available.")
 
     result = agent_service.answer_question(text, session_id=request.session_id)
 
@@ -204,6 +225,8 @@ def chat_endpoint(request: ChatRequest, req: Request):
             status=tc.status,
             duration_ms=tc.duration_ms,
             error=tc.error,
+            arguments=tc.arguments,
+            output=tc.output,
         )
         for tc in result.tool_calls
     ]

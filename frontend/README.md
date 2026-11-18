@@ -37,6 +37,26 @@ To use a different backend URL, copy `.env.example` to `.env` and set:
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
+## AI model switching
+
+The AI Assistant can switch between Ollama (`Llama 3.2`) and llama.cpp
+(`Qwen3 1.7B`) without restarting the backend. Configure a shared administrator
+token in both environments:
+
+```env
+# backend environment
+AI_SWITCH_TOKEN=change-me
+```
+
+```env
+# frontend .env
+VITE_AI_SWITCH_TOKEN=change-me
+```
+
+The frontend sends the token as `Authorization: Bearer <token>` when calling
+`POST /ai/models/switch`. Switching is disabled when `AI_SWITCH_TOKEN` is not
+set, and the other AI endpoints remain as open as the rest of this demo API.
+
 ## Pages
 
 - Dashboard — KPIs, inventory and sales charts, alerts
