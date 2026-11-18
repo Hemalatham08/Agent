@@ -125,6 +125,12 @@ class TestChatApi(unittest.TestCase):
         self.assertEqual(len(response.tool_calls), 1)
         self.assertEqual(response.tool_calls[0].tool_name, "erp.warehouses.list")
         self.assertEqual(response.tool_calls[0].status, "succeeded")
+        self.assertEqual(response.tool_calls[0].arguments, {})
+        self.assertIsInstance(response.tool_calls[0].output, dict)
+        self.assertEqual(
+            response.tool_calls[0].output["items"][0]["warehouse_name"],
+            "Main Warehouse",
+        )
         self.assertEqual(response.model, "llama3.2")
         self.assertIsNone(response.error)
 

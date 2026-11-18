@@ -23,10 +23,51 @@ export interface ChatRequest {
   history: ChatMessage[]
 }
 
+export interface ToolCallResult {
+  tool_name: string
+  status: string
+  arguments?: Record<string, unknown>
+  duration_ms?: number | null
+  error?: string | null
+  output?: unknown
+}
+
 export interface ChatResponse {
   answer: string
   model: string
+  tool_calls?: ToolCallResult[]
+  status?: string
+  error?: string | null
 }
+
+export interface AiModelInfo {
+  provider: string
+  model: string
+  base_url: string
+  available: boolean
+  active: boolean
+  reason: string | null
+}
+
+export interface AiModelsResponse {
+  providers: AiModelInfo[]
+  active: AiModelInfo
+}
+
+export interface SwitchAiModelResponse extends AiModelInfo {
+  previous_provider: string | null
+}
+
+export const AI_PROVIDER_LABELS: Record<string, string> = {
+  ollama: 'Ollama — Llama 3.2',
+  llamacpp: 'Qwen3 1.7B',
+}
+
+export function aiModelLabel(info: Pick<AiModelInfo, 'provider' | 'model'>): string {
+  return AI_PROVIDER_LABELS[info.provider] ?? `${info.model} (${info.provider})`
+}
+
+const AI_SWITCH_TOKEN = (import.meta.env.VITE_AI_SWITCH_TOKEN ?? '').trim()
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -61,6 +102,16 @@ export const erpApi = {
     request<ChatResponse>('/chat', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+  getAiModels: () => request<AiModelsResponse>('/ai/models'),
+  getActiveAiModel: () => request<AiModelInfo>('/ai/models/active'),
+  switchAiModel: (provider: string) =>
+    request<SwitchAiModelResponse>('/ai/models/switch', {
+      method: 'POST',
+      headers: AI_SWITCH_TOKEN
+        ? { Authorization: `Bearer ${AI_SWITCH_TOKEN}` }
+        : undefined,
+      body: JSON.stringify({ provider }),
     }),
   getProducts: () => request<Product[]>('/products'),
   getProduct: (productId: string) =>

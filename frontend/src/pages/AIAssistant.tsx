@@ -2,20 +2,25 @@ import {
   ArrowRight,
   Bot,
   CircleAlert,
+  Cpu,
   Database,
+  Info,
   LoaderCircle,
   MessageSquare,
+  PanelRightClose,
+  PanelRightOpen,
   Send,
   Sparkles,
   UserRound,
-  Zap,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
+import { AiModelSelector } from '../components/ai/AiModelSelector'
+import { AssistantResponse } from '../components/ai/AssistantResponse'
 import { Card, CardHeader } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
-import { API_BASE_URL, erpApi } from '../services/api'
-import type { ChatMessage } from '../services/api'
+import { API_BASE_URL, aiModelLabel, erpApi } from '../services/api'
+import type { AiModelInfo, ChatMessage, ToolCallResult } from '../services/api'
 
 const suggestedQuestions = [
   'How much free stock do we have for Hex Bolt M10?',
@@ -37,17 +42,71 @@ const tools = [
   'Unpaid invoices',
 ]
 
+// Chat entries carry their own generation duration so every assistant message
+// keeps its timing for the lifetime of the current session.
+interface ChatEntry extends ChatMessage {
+  durationMs?: number
+  toolCalls?: ToolCallResult[]
+  question?: string
+}
+
+function formatDurationSeconds(durationMs: number): string {
+  return (durationMs / 1000).toFixed(2)
+}
+
 export default function AIAssistant() {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [messages, setMessages] = useState<ChatEntry[]>([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [model, setModel] = useState<string | null>(null)
-  const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const [providers, setProviders] = useState<AiModelInfo[]>([])
+  const [activeModelInfo, setActiveModelInfo] = useState<AiModelInfo | null>(null)
+  const [isModelsLoading, setIsModelsLoading] = useState(true)
+  const [isSwitchingModel, setIsSwitchingModel] = useState(false)
+  const [modelError, setModelError] = useState<string | null>(null)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+  const chatScrollRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
 
+  const loadModels = useCallback(async () => {
+    try {
+      const response = await erpApi.getAiModels()
+      setProviders(response.providers)
+      setActiveModelInfo(response.active)
+      setModelError(null)
+    } catch (requestError) {
+      setModelError(
+        requestError instanceof Error
+          ? requestError.message
+          : 'Could not load AI models.',
+      )
+    } finally {
+      setIsModelsLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    // Provider status comes from the backend, so this effect synchronises with
+    // an external system. The state updates happen after the request resolves.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadModels()
+  }, [loadModels])
+
+  useEffect(() => {
+    const scrollContainer = chatScrollRef.current
+
+    if (!scrollContainer) {
+      return
+    }
+
+    // Only scroll the conversation panel, not the page. Using scrollIntoView
+    // here would also scroll the whole page and hide the chat panel at high
+    // browser zoom levels.
+    scrollContainer.scrollTo({
+      top: scrollContainer.scrollHeight,
+      behavior: 'smooth',
+    })
   }, [messages, isLoading, error])
 
   async function submitQuestion(rawQuestion: string) {
@@ -57,7 +116,13 @@ export default function AIAssistant() {
       return
     }
 
-    const history = messages.slice(-20)
+    const history: ChatMessage[] = messages
+      .slice(-20)
+      .map(({ role, content }) => ({ role, content }))
+
+    // Measure the full user-perceived request: backend processing plus any ERP
+    // tool execution that happens before the answer comes back.
+    const startedAt = performance.now()
 
     setMessages((current) => [...current, { role: 'user', content: question }])
     setInput('')
@@ -66,9 +131,16 @@ export default function AIAssistant() {
 
     try {
       const response = await erpApi.chat({ question, history })
+      const durationMs = performance.now() - startedAt
       setMessages((current) => [
         ...current,
-        { role: 'assistant', content: response.answer },
+        {
+          role: 'assistant',
+          content: response.answer,
+          durationMs,
+          toolCalls: response.tool_calls,
+          question,
+        },
       ])
       setModel(response.model)
     } catch (requestError) {
@@ -95,52 +167,114 @@ export default function AIAssistant() {
     }
   }
 
-  const isConnected = model !== null && error === null
+  async function handleModelSwitch(provider: string) {
+    if (
+      !provider ||
+      provider === activeModelInfo?.provider ||
+      isSwitchingModel
+    ) {
+      return
+    }
+
+    setIsSwitchingModel(true)
+    setModelError(null)
+
+    try {
+      const switched = await erpApi.switchAiModel(provider)
+      setActiveModelInfo(switched)
+      setModel(switched.model)
+      await loadModels()
+    } catch (requestError) {
+      setModelError(
+        requestError instanceof Error
+          ? requestError.message
+          : 'Could not switch AI models.',
+      )
+    } finally {
+      setIsSwitchingModel(false)
+    }
+  }
+
+  const hasProviderIssue =
+    modelError !== null || activeModelInfo?.available === false
+  const isConnected =
+    activeModelInfo?.available === true ||
+    (activeModelInfo === null && model !== null && error === null)
   const statusLabel = isLoading
     ? 'Thinking...'
     : error
       ? 'Connection issue'
-      : isConnected
-        ? `Connected · ${model}`
-        : 'Ready'
+      : isSwitchingModel
+        ? 'Switching model...'
+        : activeModelInfo?.available === false
+          ? 'Provider unavailable'
+          : activeModelInfo?.available
+            ? `Connected · ${aiModelLabel(activeModelInfo)}`
+            : model
+              ? `Connected · ${model}`
+              : isModelsLoading
+                ? 'Checking models...'
+                : 'Ready'
 
   return (
-    <div className="-my-6 flex h-[calc(100dvh-4rem)] min-h-0 flex-col overflow-hidden py-6 lg:-my-8 lg:py-8">
+    <div className="flex min-h-0 flex-col">
       <PageHeader
-        className="mb-3 shrink-0 gap-2 sm:mb-4"
+        className="mb-3 gap-2 sm:mb-4"
         title="AI Assistant"
         description="An ERP-aware copilot that answers natural-language questions using live business data."
         eyebrow="iFive Copilot"
         actions={
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-semibold ${
-              error
-                ? 'border-rose-200 bg-rose-50 text-rose-700'
-                : isLoading
-                  ? 'border-amber-200 bg-amber-50 text-amber-700'
-                  : isConnected
-                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                    : 'border-slate-200 bg-white text-slate-500'
-            }`}
-          >
+          <>
             <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                error
-                  ? 'bg-rose-500'
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] font-semibold ${
+                error || hasProviderIssue
+                  ? 'border-rose-200 bg-rose-50 text-rose-700'
                   : isLoading
-                    ? 'animate-pulse bg-amber-500'
+                    ? 'border-amber-200 bg-amber-50 text-amber-700'
                     : isConnected
-                      ? 'bg-emerald-500'
-                      : 'bg-slate-400'
+                      ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                      : 'border-slate-200 bg-white text-slate-500'
               }`}
-            />
-            {statusLabel}
-          </span>
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  error || hasProviderIssue
+                    ? 'bg-rose-500'
+                    : isLoading
+                      ? 'animate-pulse bg-amber-500'
+                      : isConnected
+                        ? 'bg-emerald-500'
+                        : 'bg-slate-400'
+                }`}
+              />
+              {statusLabel}
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsSidebarOpen((open) => !open)}
+              aria-expanded={isSidebarOpen}
+              aria-controls="assistant-sidebar"
+              className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
+            >
+              {isSidebarOpen ? (
+                <PanelRightClose className="h-3.5 w-3.5" />
+              ) : (
+                <PanelRightOpen className="h-3.5 w-3.5" />
+              )}
+              {isSidebarOpen ? 'Hide Sidebar' : 'Show Sidebar'}
+            </button>
+          </>
         }
       />
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-hidden xl:grid-cols-[1fr_340px] xl:gap-5">
-        <Card className="flex min-h-0 flex-col overflow-hidden">
+      <div
+        className={`grid grid-cols-1 gap-4 transition-[grid-template-columns,gap] duration-300 ease-out xl:items-start ${
+          isSidebarOpen
+            ? 'xl:grid-cols-[minmax(0,3fr)_minmax(0,1fr)] xl:gap-5'
+            : 'xl:grid-cols-[minmax(0,1fr)_0fr] xl:gap-0'
+        }`}
+      >
+        <Card className="flex h-[clamp(24rem,70dvh,44rem)] min-w-0 flex-col overflow-hidden xl:h-[calc(100dvh-14rem)] xl:max-h-[52rem] xl:min-h-[30rem]">
           <div className="flex shrink-0 items-center gap-3 border-b border-slate-100 px-5 py-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-navy-900 text-white">
               <Bot className="h-5 w-5" />
@@ -148,15 +282,44 @@ export default function AIAssistant() {
             <div className="min-w-0">
               <p className="text-sm font-semibold text-slate-900">iFive Copilot</p>
               <p className="text-[11px] text-slate-400">
-                ERP assistant powered by local Ollama models
+                ERP assistant powered by local AI models
               </p>
             </div>
-            <span className="ml-auto max-w-40 truncate rounded-full bg-slate-100 px-2.5 py-1 font-mono text-[10px] font-semibold text-slate-500">
-              {model ?? 'Ollama'}
-            </span>
+            <div className="ml-auto flex min-w-0 justify-end">
+              <AiModelSelector
+                providers={providers}
+                activeModel={activeModelInfo}
+                isModelsLoading={isModelsLoading}
+                isSwitching={isSwitchingModel}
+                onSelect={handleModelSwitch}
+              />
+            </div>
           </div>
 
-          <div className="scrollbar-thin flex-1 space-y-4 overflow-y-auto bg-slate-50/40 p-4 sm:p-5">
+          {modelError ? (
+            <div
+              role="alert"
+              data-testid="model-error"
+              className="flex items-start gap-2 border-b border-amber-100 bg-amber-50 px-4 py-2.5"
+            >
+              <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <p className="min-w-0 flex-1 break-words text-[11px] leading-5 text-amber-800">
+                {modelError}
+              </p>
+              <button
+                type="button"
+                onClick={() => setModelError(null)}
+                className="shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold text-amber-700 transition hover:bg-amber-100"
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : null}
+
+          <div
+            ref={chatScrollRef}
+            className="scrollbar-thin min-h-0 flex-1 space-y-4 overflow-y-auto bg-slate-50/40 p-4 sm:p-5"
+          >
             {messages.length === 0 && !isLoading ? (
               <div className="flex h-full min-h-0 flex-col items-center justify-center px-4 py-6 text-center">
                 <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-50 text-accent-600 sm:h-14 sm:w-14">
@@ -198,10 +361,29 @@ export default function AIAssistant() {
                       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-600 text-white">
                         <Sparkles className="h-4 w-4" />
                       </div>
-                      <div className="max-w-[85%] rounded-2xl rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                        <p className="whitespace-pre-wrap break-words text-xs leading-5 text-slate-700">
-                          {message.content}
-                        </p>
+                      <div className="flex min-w-0 max-w-[85%] flex-col items-start gap-1.5">
+                        <div
+                          data-testid="assistant-bubble"
+                          className="rounded-2xl rounded-tl-md border border-slate-200 bg-white px-4 py-3 shadow-sm"
+                        >
+                          <AssistantResponse
+                            content={message.content}
+                            toolCalls={message.toolCalls}
+                            question={message.question}
+                          />
+                        </div>
+                        {typeof message.durationMs === 'number' ? (
+                          <p
+                            data-testid="response-duration"
+                            className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500"
+                          >
+                            <span aria-hidden="true">⏱️</span>
+                            <span>
+                              Response generated in{' '}
+                              {formatDurationSeconds(message.durationMs)} seconds
+                            </span>
+                          </p>
+                        ) : null}
                       </div>
                     </div>
                   ),
@@ -241,8 +423,6 @@ export default function AIAssistant() {
                     </button>
                   </div>
                 )}
-
-                <div ref={messagesEndRef} />
               </>
             )}
           </div>
@@ -282,14 +462,34 @@ export default function AIAssistant() {
           </div>
         </Card>
 
-        <div className="flex min-h-0 flex-col gap-4 overflow-hidden xl:gap-5">
-          <Card className="flex min-h-0 shrink flex-col overflow-hidden">
-            <CardHeader
-              title="Suggested questions"
-              description="Click a prompt to add it to the composer"
-              icon={MessageSquare}
-            />
-            <div className="scrollbar-thin min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-3">
+        <div
+          id="assistant-sidebar"
+          aria-hidden={!isSidebarOpen}
+          inert={!isSidebarOpen}
+          className={`flex min-w-0 flex-col gap-4 transition-[opacity,transform] duration-300 ease-out xl:gap-5 ${
+            isSidebarOpen
+              ? 'opacity-100'
+              : 'max-xl:hidden xl:pointer-events-none xl:max-h-0 xl:overflow-hidden xl:translate-x-2 xl:opacity-0'
+          }`}
+        >
+          <Card className="flex flex-col">
+            <div className="flex items-center gap-2 border-b border-slate-100 px-3 py-2">
+              <MessageSquare className="h-3.5 w-3.5 shrink-0 text-accent-600" />
+              <h2 className="min-w-0 text-[11px] font-semibold text-slate-700">
+                Suggested questions
+              </h2>
+              <span
+                className="ml-auto inline-flex shrink-0 text-slate-400"
+                title="Ask in plain language. The agent selects an ERP data tool and grounds the answer in live records."
+              >
+                <Info className="h-3.5 w-3.5" aria-hidden="true" />
+                <span className="sr-only">
+                  How it works: ask in plain language. The agent selects an ERP data
+                  tool and grounds the answer in live records.
+                </span>
+              </span>
+            </div>
+            <div className="space-y-0.5 p-1.5">
               {suggestedQuestions.map((question) => (
                 <button
                   key={question}
@@ -299,62 +499,55 @@ export default function AIAssistant() {
                     inputRef.current?.focus()
                   }}
                   disabled={isLoading}
-                  className="group flex w-full items-start gap-2 rounded-xl px-2.5 py-1.5 text-left text-[11px] leading-5 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="group flex w-full items-start gap-1.5 rounded-lg px-2 py-1.5 text-left text-[11px] leading-4 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <ArrowRight className="mt-1 h-3 w-3 shrink-0 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-accent-500" />
+                  <ArrowRight className="mt-0.5 h-2.5 w-2.5 shrink-0 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-accent-500" />
                   <span>{question}</span>
                 </button>
               ))}
             </div>
           </Card>
 
-          <Card className="flex min-h-0 shrink-0 flex-col overflow-hidden">
-            <CardHeader
-              title="How it works"
-              description="Live agent workflow"
-              icon={Zap}
-            />
-            <ol className="space-y-2 px-5 pb-4">
-              {[
-                'Ask a question in natural language.',
-                'The agent selects an ERP data tool.',
-                'Ollama grounds the answer in live records.',
-              ].map((step, index) => (
-                <li key={step} className="flex items-start gap-3">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent-50 text-[10px] font-bold text-accent-700">
-                    {index + 1}
-                  </span>
-                  <span className="text-[11px] leading-5 text-slate-600">{step}</span>
-                </li>
-              ))}
-            </ol>
-          </Card>
-
-          <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <Card className="flex flex-col">
             <CardHeader
               title="Backend status"
               description="Live integration"
               icon={Database}
             />
-            <div className="scrollbar-thin min-h-0 flex-1 space-y-3 overflow-y-auto px-5 pb-4">
+            <div className="space-y-3 px-5 pb-4">
               <div
                 className={`flex items-center gap-2 rounded-xl px-3 py-2.5 ${
-                  error ? 'bg-rose-50' : 'bg-emerald-50'
+                  error || hasProviderIssue ? 'bg-rose-50' : 'bg-emerald-50'
                 }`}
               >
                 <span
                   className={`h-1.5 w-1.5 rounded-full ${
-                    error ? 'bg-rose-500' : 'bg-emerald-500'
+                    error || hasProviderIssue ? 'bg-rose-500' : 'bg-emerald-500'
                   }`}
                 />
                 <span
                   className={`text-[11px] font-semibold ${
-                    error ? 'text-rose-700' : 'text-emerald-700'
+                    error || hasProviderIssue
+                      ? 'text-rose-700'
+                      : 'text-emerald-700'
                   }`}
                 >
-                  {error ? 'Last request failed' : 'POST /chat connected'}
+                  {isModelsLoading
+                    ? 'Checking AI providers...'
+                    : activeModelInfo?.available === false
+                      ? 'Provider unavailable'
+                      : error
+                        ? 'Last request failed'
+                        : activeModelInfo
+                          ? 'Provider connected'
+                          : 'Provider status unknown'}
                 </span>
               </div>
+              {activeModelInfo?.reason && !activeModelInfo.available ? (
+                <p className="break-words text-[10px] leading-4 text-rose-600">
+                  {activeModelInfo.reason}
+                </p>
+              ) : null}
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                   API base URL
@@ -365,10 +558,29 @@ export default function AIAssistant() {
               </div>
               <div>
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  Provider
+                </p>
+                <p className="mt-1 flex items-center gap-1.5 break-all font-mono text-[10px] text-slate-600">
+                  <Cpu className="h-3 w-3 shrink-0 text-slate-400" />
+                  {activeModelInfo
+                    ? aiModelLabel(activeModelInfo)
+                    : 'Configured by backend'}
+                </p>
+              </div>
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                   Active model
                 </p>
                 <p className="mt-1 break-all font-mono text-[10px] text-slate-600">
-                  {model ?? 'Configured by backend'}
+                  {activeModelInfo?.model ?? model ?? 'Configured by backend'}
+                </p>
+              </div>
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  Provider URL
+                </p>
+                <p className="mt-1 break-all font-mono text-[10px] text-slate-600">
+                  {activeModelInfo?.base_url ?? 'Not reported'}
                 </p>
               </div>
               <div>
