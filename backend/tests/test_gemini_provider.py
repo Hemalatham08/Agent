@@ -6,8 +6,10 @@ Uses mocks only. No real Gemini API calls are made.
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -43,6 +45,7 @@ from backend.agent.tools.contracts import (
     ToolExecutionResult,
     ToolExecutionStatus,
 )
+from backend.tests.erp_support import create_erp_fixture_db
 
 
 def _make_gemini_client():
@@ -122,10 +125,13 @@ class TestGeminiOrchestratorIntegration(unittest.TestCase):
         from backend.agent.erp.platform import ErpToolPlatform
         from backend.agent.erp.config import ErpDatabaseConfig
 
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        database_path = create_erp_fixture_db(
+            Path(self._temp_dir.name) / "erp.db"
+        )
         self.platform = ErpToolPlatform.from_config(
-            ErpDatabaseConfig.from_path(
-                "D:/Agent/Agent/backend/data/ifive_erp.db"
-            )
+            ErpDatabaseConfig.from_path(database_path)
         )
 
     def tearDown(self):
@@ -281,10 +287,13 @@ class TestGeminiOrchestratorToolCalls(unittest.TestCase):
         from backend.agent.erp.platform import ErpToolPlatform
         from backend.agent.erp.config import ErpDatabaseConfig
 
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        database_path = create_erp_fixture_db(
+            Path(self._temp_dir.name) / "erp.db"
+        )
         self.platform = ErpToolPlatform.from_config(
-            ErpDatabaseConfig.from_path(
-                "D:/Agent/Agent/backend/data/ifive_erp.db"
-            )
+            ErpDatabaseConfig.from_path(database_path)
         )
 
     def tearDown(self):

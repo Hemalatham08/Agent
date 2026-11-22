@@ -57,6 +57,16 @@ _GEMINI_STATUS_NOT_FOUND = 404
 _GEMINI_STATUS_BAD_REQUEST = 400
 _GEMINI_STATUS_FORBIDDEN = 403
 _GEMINI_STATUS_QUOTA_EXCEEDED = 429
+_GEMINI_STATUS_UNAVAILABLE = 503
+
+# Only transient service and rate-limit responses are retried. Authentication,
+# permission, invalid-request, and model-not-found errors fail immediately.
+_RETRYABLE_GEMINI_STATUS_CODES = frozenset(
+    {_GEMINI_STATUS_QUOTA_EXCEEDED, _GEMINI_STATUS_UNAVAILABLE}
+)
+_MAX_CHAT_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 2.0
 
 # Persistent client timeout for metadata operations (list_models, validate_availability).
 # These calls use the persistent client which is created once. Use a generous
@@ -80,6 +90,25 @@ def _safe_get_attr(obj: Any, name: str, default: Any = None) -> Any:
     except Exception:
         return default
     return value
+
+
+def _sdk_error_status_code(err: Exception) -> int | None:
+    """Return the HTTP status of an SDK API error, if one is present."""
+    if genai_errors is None or not isinstance(err, genai_errors.APIError):
+        return None
+    code = getattr(err, "code", None)
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def _is_retryable_sdk_error(err: Exception) -> bool:
+    """Return whether an SDK error represents a transient retryable failure."""
+    return _sdk_error_status_code(err) in _RETRYABLE_GEMINI_STATUS_CODES
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    """Return a bounded exponential backoff delay for a 1-based attempt."""
+    delay = _RETRY_BASE_DELAY_SECONDS * (2 ** max(attempt - 1, 0))
+    return min(delay, _RETRY_MAX_DELAY_SECONDS)
 
 
 def _map_sdk_error(err: Exception) -> GeminiError:
@@ -351,23 +380,47 @@ class GeminiClient:
 
         try:
             started_at = time.perf_counter()
-            try:
-                response = client_to_use.models.generate_content(
-                    model=self.config.model,
-                    contents=contents,
-                    config=config,
-                )
-            except Exception as err:
-                request_duration_ms = _elapsed_ms(started_at)
-                _LOGGER.warning(
-                    "gemini_chat error model=%s request_ms=%s error_type=%s",
-                    self.config.model,
-                    request_duration_ms,
-                    type(err).__name__,
-                )
-                # Suppress the raw SDK exception chain so sensitive SDK error
-                # messages cannot appear in formatted tracebacks.
-                raise _map_sdk_error(err) from None
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = client_to_use.models.generate_content(
+                        model=self.config.model,
+                        contents=contents,
+                        config=config,
+                    )
+                    break
+                except Exception as err:
+                    request_duration_ms = _elapsed_ms(started_at)
+                    status_code = _sdk_error_status_code(err)
+                    if _is_retryable_sdk_error(err) and attempt < _MAX_CHAT_ATTEMPTS:
+                        delay = _retry_delay_seconds(attempt)
+                        _LOGGER.warning(
+                            "gemini_chat retry model=%s attempt=%s/%s "
+                            "request_ms=%s status=%s delay_s=%.2f "
+                            "error_type=%s",
+                            self.config.model,
+                            attempt,
+                            _MAX_CHAT_ATTEMPTS,
+                            request_duration_ms,
+                            status_code,
+                            delay,
+                            type(err).__name__,
+                        )
+                        time.sleep(delay)
+                        continue
+                    _LOGGER.warning(
+                        "gemini_chat error model=%s attempt=%s request_ms=%s "
+                        "status=%s error_type=%s",
+                        self.config.model,
+                        attempt,
+                        request_duration_ms,
+                        status_code,
+                        type(err).__name__,
+                    )
+                    # Suppress the raw SDK exception chain so sensitive SDK error
+                    # messages cannot appear in formatted tracebacks.
+                    raise _map_sdk_error(err) from None
 
             request_duration_ms = _elapsed_ms(started_at)
 

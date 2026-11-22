@@ -20,7 +20,19 @@ import { AssistantResponse } from '../components/ai/AssistantResponse'
 import { Card, CardHeader } from '../components/ui/Card'
 import { PageHeader } from '../components/ui/PageHeader'
 import { API_BASE_URL, aiModelLabel, erpApi } from '../services/api'
-import type { AiModelInfo, ChatMessage, ToolCallResult } from '../services/api'
+import type {
+  AiModelInfo,
+  ChatMessage,
+  ChartSpec,
+  ToolCallResult,
+} from '../services/api'
+import {
+  MicrophoneButton,
+  SpeechButton,
+  VoiceStatus,
+  useSpeechRecognition,
+  useSpeechSynthesis,
+} from '../voice_module'
 
 const suggestedQuestions = [
   'How much free stock do we have for Hex Bolt M10?',
@@ -47,6 +59,7 @@ const tools = [
 interface ChatEntry extends ChatMessage {
   durationMs?: number
   toolCalls?: ToolCallResult[]
+  charts?: ChartSpec[]
   question?: string
 }
 
@@ -68,6 +81,29 @@ export default function AIAssistant() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const chatScrollRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
+  const voiceInputBaseRef = useRef('')
+
+  const {
+    isSupported: isVoiceInputSupported,
+    isListening: isListeningForVoice,
+    error: voiceInputError,
+    start: startVoiceInput,
+    stop: stopVoiceInput,
+    resetError: resetVoiceInputError,
+  } = useSpeechRecognition({
+    onTranscript: ({ transcript }) => {
+      const spoken = transcript.trim()
+      const base = voiceInputBaseRef.current
+      setInput(base && spoken ? `${base} ${spoken}` : spoken || base)
+    },
+  })
+
+  const {
+    isSupported: isSpeechPlaybackSupported,
+    speakingId,
+    error: speechPlaybackError,
+    toggle: toggleSpeechPlayback,
+  } = useSpeechSynthesis()
 
   const loadModels = useCallback(async () => {
     try {
@@ -116,6 +152,10 @@ export default function AIAssistant() {
       return
     }
 
+    if (isListeningForVoice) {
+      stopVoiceInput()
+    }
+
     const history: ChatMessage[] = messages
       .slice(-20)
       .map(({ role, content }) => ({ role, content }))
@@ -139,6 +179,7 @@ export default function AIAssistant() {
           content: response.answer,
           durationMs,
           toolCalls: response.tool_calls,
+          charts: response.charts,
           question,
         },
       ])
@@ -165,6 +206,19 @@ export default function AIAssistant() {
       event.preventDefault()
       void submitQuestion(input)
     }
+  }
+
+  function handleVoiceToggle() {
+    if (isListeningForVoice) {
+      stopVoiceInput()
+      inputRef.current?.focus()
+      return
+    }
+
+    // Preserve any text the user typed before dictating; recognised speech is
+    // appended to it and remains fully editable before sending.
+    voiceInputBaseRef.current = input.trim()
+    startVoiceInput()
   }
 
   async function handleModelSwitch(provider: string) {
@@ -369,6 +423,7 @@ export default function AIAssistant() {
                           <AssistantResponse
                             content={message.content}
                             toolCalls={message.toolCalls}
+                            charts={message.charts}
                             question={message.question}
                           />
                         </div>
@@ -382,6 +437,25 @@ export default function AIAssistant() {
                               Response generated in{' '}
                               {formatDurationSeconds(message.durationMs)} seconds
                             </span>
+                          </p>
+                        ) : null}
+                        <SpeechButton
+                          isSpeaking={speakingId === `assistant-${index}`}
+                          isSupported={isSpeechPlaybackSupported}
+                          onClick={() =>
+                            toggleSpeechPlayback(
+                              `assistant-${index}`,
+                              message.content,
+                            )
+                          }
+                        />
+                        {speechPlaybackError?.responseId ===
+                        `assistant-${index}` ? (
+                          <p
+                            role="alert"
+                            className="break-words text-[10px] leading-4 text-rose-600"
+                          >
+                            {speechPlaybackError.message}
                           </p>
                         ) : null}
                       </div>
@@ -442,6 +516,12 @@ export default function AIAssistant() {
                 placeholder="Ask about inventory, orders, invoices..."
                 className="max-h-20 min-h-9 flex-1 resize-none bg-transparent px-2 py-2 text-xs text-slate-700 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-slate-400"
               />
+              <MicrophoneButton
+                isListening={isListeningForVoice}
+                isSupported={isVoiceInputSupported}
+                disabled={isLoading}
+                onClick={handleVoiceToggle}
+              />
               <button
                 type="submit"
                 disabled={isLoading || !input.trim()}
@@ -455,6 +535,11 @@ export default function AIAssistant() {
                 )}
               </button>
             </form>
+            <VoiceStatus
+              isListening={isListeningForVoice}
+              error={voiceInputError}
+              onDismissError={resetVoiceInputError}
+            />
             <p className="mt-1.5 flex items-center justify-center gap-1.5 text-center text-[10px] text-slate-400">
               <Database className="h-3 w-3" />
               Answers are generated from ERP records returned by backend tools.
@@ -495,6 +580,9 @@ export default function AIAssistant() {
                   key={question}
                   type="button"
                   onClick={() => {
+                    if (isListeningForVoice) {
+                      stopVoiceInput()
+                    }
                     setInput(question)
                     inputRef.current?.focus()
                   }}

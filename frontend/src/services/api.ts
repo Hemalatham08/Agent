@@ -16,6 +16,18 @@ export const API_BASE_URL = (
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  charts?: ChartSpec[]
+}
+
+export interface ChartSpec {
+  chart_type: 'bar' | 'line' | 'pie' | 'grouped_bar'
+  title: string
+  data: Record<string, unknown>[]
+  x_field: string
+  y_fields: string[]
+  x_label?: string
+  y_label?: string
+  color_scheme?: string
 }
 
 export interface ChatRequest {
@@ -38,6 +50,7 @@ export interface ChatResponse {
   tool_calls?: ToolCallResult[]
   status?: string
   error?: string | null
+  charts?: ChartSpec[]
 }
 
 export interface AiModelInfo {
@@ -61,6 +74,7 @@ export interface SwitchAiModelResponse extends AiModelInfo {
 export const AI_PROVIDER_LABELS: Record<string, string> = {
   ollama: 'Ollama — Llama 3.2',
   llamacpp: 'Qwen3 1.7B',
+  gemini: 'Gemini (Google)',
 }
 
 export function aiModelLabel(info: Pick<AiModelInfo, 'provider' | 'model'>): string {

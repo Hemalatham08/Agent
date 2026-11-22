@@ -30,9 +30,14 @@ _EXPECTED_TOOL_NAMES = (
     "erp.warehouses.list",
     "erp.inventory.low_stock",
     "erp.sales_orders.get",
+    "erp.sales_orders.search",
     "erp.dispatches.get",
     "erp.dispatches.list",
     "erp.dispatches.by_sales_order",
+    "erp.finance.sales_summary",
+    "erp.finance.purchase_summary",
+    "erp.warehouse.movement_summary",
+    "erp.fulfillment.summary",
 )
 
 _ALLOWED_SCHEMA_KEYS = {
@@ -85,9 +90,14 @@ class ErpToolDefinitionTests(unittest.TestCase):
             "erp.warehouses.list": set(),
             "erp.inventory.low_stock": set(),
             "erp.sales_orders.get": {"so_id"},
+            "erp.sales_orders.search": set(),
             "erp.dispatches.get": {"dispatch_id"},
             "erp.dispatches.list": set(),
             "erp.dispatches.by_sales_order": {"so_id"},
+            "erp.finance.sales_summary": set(),
+            "erp.finance.purchase_summary": set(),
+            "erp.warehouse.movement_summary": set(),
+            "erp.fulfillment.summary": set(),
         }
         for definition in ERP_TOOL_DEFINITIONS:
             with self.subTest(tool=definition.name):
