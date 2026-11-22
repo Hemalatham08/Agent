@@ -13,13 +13,15 @@ from backend.agent.llm.errors import LlmError
 from backend.agent.llm.llamacpp import LlamaCppConfig
 from backend.agent.llm.models import ChatMessage, LLMResponse
 from backend.agent.llm.provider import (
+    GEMINI_PROVIDER,
     LLAMACPP_PROVIDER,
     OLLAMA_PROVIDER,
-    SUPPORTED_PROVIDERS,
+    configured_provider_names,
     create_llm_client,
     resolve_provider_name,
 )
 from backend.agent.services.agent_service import AgentService
+from backend.ai_providers.gemini.config import GeminiConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,9 +31,10 @@ SWITCH_VALIDATION_TIMEOUT_SECONDS = 10.0
 PROVIDER_DISPLAY_NAMES = {
     OLLAMA_PROVIDER: "Llama 3.2 (Ollama)",
     LLAMACPP_PROVIDER: "Qwen3 1.7B (llama.cpp)",
+    GEMINI_PROVIDER: "Gemini (Google)",
 }
 
-ProviderConfig = LlmConfig | LlamaCppConfig
+ProviderConfig = LlmConfig | LlamaCppConfig | GeminiConfig
 ClientFactory = Callable[[str, ProviderConfig], LlmClient]
 
 
@@ -87,6 +90,11 @@ def _default_client_factory(provider: str, config: ProviderConfig) -> LlmClient:
         if not isinstance(config, LlamaCppConfig):
             raise TypeError("llama.cpp provider requires a LlamaCppConfig")
         return create_llm_client(provider, llamacpp_config=config)
+
+    if provider == GEMINI_PROVIDER:
+        if not isinstance(config, GeminiConfig):
+            raise TypeError("Gemini provider requires a GeminiConfig")
+        return create_llm_client(provider, gemini_config=config)
 
     if not isinstance(config, LlmConfig):
         raise TypeError("Ollama provider requires an LlmConfig")
@@ -149,7 +157,7 @@ class RuntimeAiModelManager:
         client_factory: ClientFactory | None = None,
     ) -> None:
         self._platform = platform
-        self._client_factory = client_factory or _default_client_factory
+        self._client_factory = client_factory or self._default_client_factory
         self._lock = threading.RLock()
         self._switch_lock = threading.Lock()
         self._closed = False
@@ -191,21 +199,60 @@ class RuntimeAiModelManager:
         with self._lock:
             return self._active_lease.client.config
 
+    def _default_client_factory(
+        self,
+        provider: str,
+        config: ProviderConfig,
+    ) -> LlmClient:
+        """Build the default client, wiring the ERP tool registry into Gemini."""
+
+        if provider == GEMINI_PROVIDER:
+            if not isinstance(config, GeminiConfig):
+                raise TypeError("Gemini provider requires a GeminiConfig")
+            return create_llm_client(
+                provider,
+                gemini_config=config,
+                tool_registry=self._platform.registry,
+            )
+        return _default_client_factory(provider, config)
+
     def _config_for(self, provider: str) -> ProviderConfig:
         if provider == LLAMACPP_PROVIDER:
             return LlamaCppConfig.from_env()
+        if provider == GEMINI_PROVIDER:
+            return GeminiConfig.from_env()
         return LlmConfig.from_env()
 
     def _probe_timeout(self, config: ProviderConfig) -> float:
         return min(config.timeout_seconds, PROBE_TIMEOUT_SECONDS)
 
     def _probe(self, provider: str) -> ProviderInfo:
-        config = self._config_for(provider)
+        try:
+            config = self._config_for(provider)
+        except Exception as err:
+            return ProviderInfo(
+                provider=provider,
+                model="",
+                base_url="",
+                available=False,
+                active=False,
+                reason=str(err),
+            )
         probe_config = replace(
             config,
             timeout_seconds=self._probe_timeout(config),
         )
-        client = self._client_factory(provider, probe_config)
+        try:
+            client = self._client_factory(provider, probe_config)
+        except Exception as err:
+            return ProviderInfo(
+                provider=provider,
+                model=config.model,
+                base_url=config.base_url,
+                available=False,
+                active=False,
+                reason=str(err),
+            )
         try:
             client.validate_availability()
             available = True
@@ -229,8 +276,8 @@ class RuntimeAiModelManager:
         )
 
     def list_providers(self) -> list[ProviderInfo]:
-        """Probe every supported provider without changing the active one."""
-        infos = [self._probe(provider) for provider in SUPPORTED_PROVIDERS]
+        """Probe every configured provider without changing the active one."""
+        infos = [self._probe(provider) for provider in configured_provider_names()]
         with self._lock:
             active_provider = self._active_provider
         return [
@@ -298,7 +345,10 @@ class RuntimeAiModelManager:
                     raise ProviderUnavailableError(target, descriptor.reason)
                 return descriptor
 
-            config = self._config_for(target)
+            try:
+                config = self._config_for(target)
+            except Exception as err:
+                raise ProviderUnavailableError(target, str(err)) from err
             probe_config = replace(
                 config,
                 timeout_seconds=min(
@@ -306,7 +356,10 @@ class RuntimeAiModelManager:
                     SWITCH_VALIDATION_TIMEOUT_SECONDS,
                 ),
             )
-            probe = self._client_factory(target, probe_config)
+            try:
+                probe = self._client_factory(target, probe_config)
+            except Exception as err:
+                raise ProviderUnavailableError(target, str(err)) from err
             try:
                 probe.validate_availability()
             except LlmError as err:

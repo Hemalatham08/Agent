@@ -51,6 +51,10 @@ class ErpToolHandlers:
             "erp.dispatches.get": self.get_dispatch,
             "erp.dispatches.list": self.list_dispatches,
             "erp.dispatches.by_sales_order": self.get_dispatches_by_sales_order,
+            "erp.finance.sales_summary": self.sales_summary,
+            "erp.finance.purchase_summary": self.purchase_summary,
+            "erp.warehouse.movement_summary": self.movement_summary,
+            "erp.fulfillment.summary": self.fulfillment_summary,
         }
 
     def search_products(
@@ -222,6 +226,76 @@ class ErpToolHandlers:
             arguments,
             lambda args: self._service.get_dispatches_by_sales_order(
                 args["so_id"],
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def sales_summary(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.finance.sales_summary",
+            arguments,
+            lambda args: self._service.sales_summary(
+                group_by=args.get("group_by", "month"),
+                basis=args.get("basis", "dispatched"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+                limit=args.get("limit", 20),
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def purchase_summary(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.finance.purchase_summary",
+            arguments,
+            lambda args: self._service.purchase_summary(
+                group_by=args.get("group_by", "month"),
+                basis=args.get("basis", "received"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+                limit=args.get("limit", 20),
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def movement_summary(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.warehouse.movement_summary",
+            arguments,
+            lambda args: self._service.movement_summary(
+                group_by=args.get("group_by", "warehouse"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+                limit=args.get("limit", 20),
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def fulfillment_summary(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.fulfillment.summary",
+            arguments,
+            lambda args: self._service.fulfillment_summary(
+                group_by=args.get("group_by", "carrier"),
+                date_from=args.get("date_from"),
+                date_to=args.get("date_to"),
+                limit=args.get("limit", 20),
                 timeout_seconds=context.timeout_seconds,
             ),
         )

@@ -5,6 +5,32 @@ from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from backend.agent.erp.adapter import ErpReadAdapter
+from backend.agent.erp.analytics import (
+    DEFAULT_ANALYTICS_LIMIT,
+    FULFILLMENT_GROUP_BYS,
+    MAX_ANALYTICS_LIMIT,
+    MOVEMENT_GROUP_BYS,
+    PURCHASE_BASES,
+    PURCHASE_GROUP_BYS,
+    SALES_BASES,
+    build_fulfillment_query,
+    build_movement_query,
+    build_purchase_query,
+    build_sales_query,
+    make_fulfillment_result,
+    make_movement_result,
+    make_purchase_result,
+    make_sales_result,
+    normalize_date_range,
+    validate_choice,
+    validate_sales_group_by,
+)
+from backend.agent.erp.analytics_models import (
+    FulfillmentSummaryResult,
+    MovementSummaryResult,
+    PurchaseSummaryResult,
+    SalesSummaryResult,
+)
 from backend.agent.erp.config import DEFAULT_ERP_QUERY_TIMEOUT_SECONDS
 from backend.agent.erp.errors import (
     ErpConfigurationError,
@@ -62,6 +88,12 @@ _WAREHOUSE_EXISTS_SQL = """
 SELECT 1 AS found
 FROM warehouses
 WHERE warehouse_id = ?
+LIMIT 1
+"""
+
+_COMPANY_CURRENCY_SQL = """
+SELECT currency
+FROM company
 LIMIT 1
 """
 
@@ -868,6 +900,214 @@ class ErpReadService:
             dispatches_row_count=len(dispatches),
             dispatches_truncated=len(dispatch_rows) > _MAX_LIST_LIMIT,
         )
+
+    def sales_summary(
+        self,
+        group_by: str = "month",
+        basis: str = "dispatched",
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = DEFAULT_ANALYTICS_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SalesSummaryResult:
+        normalized_basis = validate_choice(basis, SALES_BASES, "basis")
+        normalized_group = validate_sales_group_by(group_by, normalized_basis)
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            MAX_ANALYTICS_LIMIT,
+        )
+        normalized_from, normalized_to = normalize_date_range(
+            date_from,
+            date_to,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        query = build_sales_query(
+            normalized_group,
+            normalized_basis,
+            normalized_from,
+            normalized_to,
+            normalized_limit,
+        )
+        totals_row = self._fetch_one(
+            query.totals_sql,
+            query.totals_params,
+            deadline,
+        ) or {}
+        rows = self._fetch_all(
+            query.rows_sql,
+            query.rows_params,
+            deadline,
+        )
+        return make_sales_result(
+            group_by=normalized_group,
+            basis=normalized_basis,
+            currency=self._currency(deadline),
+            rows=rows,
+            totals_row=totals_row,
+            limit=normalized_limit,
+        )
+
+    def purchase_summary(
+        self,
+        group_by: str = "month",
+        basis: str = "received",
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = DEFAULT_ANALYTICS_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> PurchaseSummaryResult:
+        normalized_basis = validate_choice(basis, PURCHASE_BASES, "basis")
+        normalized_group = validate_choice(
+            group_by,
+            PURCHASE_GROUP_BYS,
+            "group_by",
+        )
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            MAX_ANALYTICS_LIMIT,
+        )
+        normalized_from, normalized_to = normalize_date_range(
+            date_from,
+            date_to,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        query = build_purchase_query(
+            normalized_group,
+            normalized_basis,
+            normalized_from,
+            normalized_to,
+            normalized_limit,
+        )
+        totals_row = self._fetch_one(
+            query.totals_sql,
+            query.totals_params,
+            deadline,
+        ) or {}
+        rows = self._fetch_all(
+            query.rows_sql,
+            query.rows_params,
+            deadline,
+        )
+        return make_purchase_result(
+            group_by=normalized_group,
+            basis=normalized_basis,
+            currency=self._currency(deadline),
+            rows=rows,
+            totals_row=totals_row,
+            limit=normalized_limit,
+        )
+
+    def movement_summary(
+        self,
+        group_by: str = "warehouse",
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = DEFAULT_ANALYTICS_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> MovementSummaryResult:
+        normalized_group = validate_choice(
+            group_by,
+            MOVEMENT_GROUP_BYS,
+            "group_by",
+        )
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            MAX_ANALYTICS_LIMIT,
+        )
+        normalized_from, normalized_to = normalize_date_range(
+            date_from,
+            date_to,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        query = build_movement_query(
+            normalized_group,
+            normalized_from,
+            normalized_to,
+            normalized_limit,
+        )
+        totals_row = self._fetch_one(
+            query.totals_sql,
+            query.totals_params,
+            deadline,
+        ) or {}
+        rows = self._fetch_all(
+            query.rows_sql,
+            query.rows_params,
+            deadline,
+        )
+        return make_movement_result(
+            group_by=normalized_group,
+            currency=self._currency(deadline),
+            rows=rows,
+            totals_row=totals_row,
+            limit=normalized_limit,
+        )
+
+    def fulfillment_summary(
+        self,
+        group_by: str = "carrier",
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int = DEFAULT_ANALYTICS_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> FulfillmentSummaryResult:
+        normalized_group = validate_choice(
+            group_by,
+            FULFILLMENT_GROUP_BYS,
+            "group_by",
+        )
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            MAX_ANALYTICS_LIMIT,
+        )
+        normalized_from, normalized_to = normalize_date_range(
+            date_from,
+            date_to,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        query = build_fulfillment_query(
+            normalized_group,
+            normalized_from,
+            normalized_to,
+            normalized_limit,
+        )
+        totals_row = self._fetch_one(
+            query.totals_sql,
+            query.totals_params,
+            deadline,
+        ) or {}
+        rows = self._fetch_all(
+            query.rows_sql,
+            query.rows_params,
+            deadline,
+        )
+        return make_fulfillment_result(
+            group_by=normalized_group,
+            rows=rows,
+            totals_row=totals_row,
+            limit=normalized_limit,
+        )
+
+    def _currency(self, deadline: float) -> str:
+        row = self._fetch_one(_COMPANY_CURRENCY_SQL, (), deadline)
+        if row is None:
+            return "INR"
+        currency = row.get("currency")
+        if not isinstance(currency, str) or not currency.strip():
+            return "INR"
+        return currency.strip()
 
     def _deadline(self, timeout_seconds: float | None) -> float:
         timeout = self._effective_timeout(timeout_seconds)

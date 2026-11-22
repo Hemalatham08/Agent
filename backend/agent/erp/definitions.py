@@ -192,6 +192,138 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         version=_ERP_TOOL_VERSION,
         metadata=dict(_ERP_READ_ONLY_METADATA),
     ),
+    ToolDefinition(
+        name="erp.finance.sales_summary",
+        description=(
+            "Summarize sales revenue, standard cost, gross profit, and gross margin "
+            "by month, quarter, product, customer, or category. Arguments: group_by "
+            "(one of 'month', 'quarter', 'product', 'customer', 'category'; default "
+            "'month'), basis (one of 'dispatched', 'booked', 'invoiced'; default "
+            "'dispatched'), date_from and date_to (inclusive YYYY-MM-DD), limit "
+            "(integer 1-50, default 20). The invoiced basis supports only month, "
+            "quarter, and customer because invoices have no product lines. Cost uses "
+            "the standard product purchase price; gross profit is a standard-cost "
+            "margin, not accounting COGS. Never invent totals."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": [
+                        "month",
+                        "quarter",
+                        "product",
+                        "customer",
+                        "category",
+                    ],
+                },
+                "basis": {
+                    "type": "string",
+                    "enum": ["dispatched", "booked", "invoiced"],
+                },
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
+        name="erp.finance.purchase_summary",
+        description=(
+            "Summarize purchase expenditure by month, quarter, supplier, or product. "
+            "Arguments: group_by (one of 'month', 'quarter', 'supplier', 'product'; "
+            "default 'month'), basis (one of 'received', 'ordered'; default "
+            "'received'), date_from and date_to (inclusive YYYY-MM-DD, by order "
+            "date), limit (integer 1-50, default 20). Received value is received "
+            "quantity multiplied by unit cost; ordered value is the procurement "
+            "commitment; open value is ordered minus received value. Use this for "
+            "procurement spend, not for a list of pending purchase orders."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": ["month", "quarter", "supplier", "product"],
+                },
+                "basis": {
+                    "type": "string",
+                    "enum": ["received", "ordered"],
+                },
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
+        name="erp.warehouse.movement_summary",
+        description=(
+            "Summarize stock movement quantities by warehouse, month, quarter, "
+            "product, or movement type. Arguments: group_by (one of 'warehouse', "
+            "'month', 'quarter', 'product', 'movement_type'; default 'warehouse'), "
+            "date_from and date_to (inclusive YYYY-MM-DD), limit (integer 1-50, "
+            "default 20). Returns opening quantity, receipts, dispatches, inbound, "
+            "outbound, receipts net of dispatch, and net change. These are period "
+            "movement flows, not ending stock levels."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": [
+                        "warehouse",
+                        "month",
+                        "quarter",
+                        "product",
+                        "movement_type",
+                    ],
+                },
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
+        name="erp.fulfillment.summary",
+        description=(
+            "Summarize fulfilment performance by carrier, dispatch status, product, "
+            "or customer. Arguments: group_by (one of 'carrier', 'status', "
+            "'product', 'customer'; default 'carrier'), date_from and date_to "
+            "(inclusive YYYY-MM-DD, by dispatch date), limit (integer 1-50, default "
+            "20). Returns ordered, picked, dispatched, and open quantities plus pick "
+            "fill and order fill percentages. All-order fill includes orders with no "
+            "dispatch; dispatched-order fill uses only dispatched orders. The ERP "
+            "does not track confirmed customer delivery."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_by": {
+                    "type": "string",
+                    "enum": ["carrier", "status", "product", "customer"],
+                },
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
 )
 
 ERP_TOOL_NAMES: tuple[str, ...] = tuple(

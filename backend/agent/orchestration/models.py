@@ -33,3 +33,4 @@ class AgentExecutionResult(BaseModel):
     error: str | None = None
     iterations: int = 0
     session_id: str | None = None
+    charts: list[Any] = Field(default_factory=list)

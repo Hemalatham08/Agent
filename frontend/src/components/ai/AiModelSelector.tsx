@@ -1,4 +1,11 @@
-import { Check, ChevronDown, Cpu, LoaderCircle, Server } from 'lucide-react'
+import {
+  Check,
+  ChevronDown,
+  Cpu,
+  LoaderCircle,
+  Server,
+  Sparkles,
+} from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import type {
@@ -32,7 +39,7 @@ interface DropdownPosition {
   placement: 'top' | 'bottom'
 }
 
-const PROVIDER_ORDER = ['ollama', 'llamacpp'] as const
+const PROVIDER_ORDER = ['ollama', 'llamacpp', 'gemini'] as const
 
 const PROVIDER_META: Record<string, ProviderMeta> = {
   ollama: {
@@ -48,6 +55,13 @@ const PROVIDER_META: Record<string, ProviderMeta> = {
     endpoint: 'http://127.0.0.1:11435',
     model: 'qwen3-1.7b',
     Icon: Cpu,
+  },
+  gemini: {
+    name: 'Gemini (Google)',
+    provider: 'gemini',
+    endpoint: 'https://generativelanguage.googleapis.com',
+    model: 'gemini-3.5-flash-lite',
+    Icon: Sparkles,
   },
 }
 
@@ -122,12 +136,16 @@ export function AiModelSelector({
   const headingId = useId()
   const listboxId = useId()
 
-  // Keep the selector limited to the two supported providers, in a stable order.
-  const orderedProviders = PROVIDER_ORDER
-    .map((provider) =>
-      providers.find((candidate) => candidate.provider === provider),
-    )
+  // Keep the selector limited to the supported providers, in a stable order.
+  // Gemini is only listed once the backend confirms it is configured and
+  // reachable, so unconfigured installations look exactly as they did before.
+  const orderedProviders = PROVIDER_ORDER.map((provider) =>
+    providers.find((candidate) => candidate.provider === provider),
+  )
     .filter((provider): provider is AiModelInfo => provider !== undefined)
+    .filter(
+      (provider) => provider.provider !== 'gemini' || provider.available,
+    )
 
   const activeMeta = providerMeta(activeModel?.provider)
   const ActiveIcon = activeMeta.Icon

@@ -958,5 +958,53 @@ class TestAgentOrchestrator(unittest.TestCase):
         self.assertIn("unable to reach the local Ollama service", res.answer)
 
 
+class TestFinancialRouting(unittest.TestCase):
+    """Financial questions route to the aggregate finance tools."""
+
+    def test_required_tool_evidence_routes_financial_terms(self) -> None:
+        from backend.agent.orchestration.orchestrator import _required_tool_evidence
+
+        self.assertEqual(
+            _required_tool_evidence("What is our total revenue?"),
+            ("erp.finance.sales_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("Total sales by customer"),
+            ("erp.finance.sales_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("Invoiced revenue by month"),
+            ("erp.finance.sales_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("How much did we spend on purchases?"),
+            ("erp.finance.purchase_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("Purchase spend by supplier"),
+            ("erp.finance.purchase_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("Stock movement flow by warehouse"),
+            ("erp.warehouse.movement_summary",),
+        )
+        self.assertEqual(
+            _required_tool_evidence("What is our order fill rate?"),
+            ("erp.fulfillment.summary",),
+        )
+
+    def test_unsupported_financial_domains_stay_unsupported(self) -> None:
+        from backend.agent.orchestration.orchestrator import _required_tool_evidence
+
+        # Individual pending purchase orders and outstanding balances are not
+        # exposed by the aggregate purchase/sales tools.
+        self.assertEqual(_required_tool_evidence("Show pending purchase orders."), ())
+        self.assertEqual(
+            _required_tool_evidence("What is the outstanding invoice balance?"), ()
+        )
+        self.assertEqual(_required_tool_evidence("Create product Bolt."), ())
+        self.assertEqual(_required_tool_evidence("Delete dispatches"), ())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -98,16 +98,227 @@ _UNSUPPORTED_ERP_TERMS = (
     "update",
     "adjust",
     "purchase order",
-    "supplier",
     "quality",
     "inspection",
-    "invoice",
     "payment",
     "outstanding",
     "accounting",
     "price",
-    "revenue",
 )
+
+# (source key, column label, formatter kind)
+_AnalyticsColumn = tuple[str, str, str]
+
+_ANALYTICS_FALLBACK_TABLES: dict[
+    str,
+    tuple[tuple[_AnalyticsColumn, ...], tuple[_AnalyticsColumn, ...]],
+] = {
+    "erp.finance.sales_summary": (
+        (
+            ("key", "Group", "text"),
+            ("label", "Label", "text"),
+            ("orders", "Orders", "int"),
+            ("units", "Units", "int"),
+            ("revenue", "Revenue", "money"),
+            ("gross_profit", "Gross profit", "money"),
+            ("gross_margin_pct", "Gross margin %", "percent"),
+        ),
+        (
+            ("orders", "Orders", "int"),
+            ("units", "Units", "int"),
+            ("revenue", "Revenue", "money"),
+            ("cost", "Cost", "money"),
+            ("gross_profit", "Gross profit", "money"),
+            ("gross_margin_pct", "Gross margin %", "percent"),
+        ),
+    ),
+    "erp.finance.purchase_summary": (
+        (
+            ("key", "Group", "text"),
+            ("label", "Label", "text"),
+            ("orders", "Orders", "int"),
+            ("units_ordered", "Units ordered", "int"),
+            ("units_received", "Units received", "int"),
+            ("ordered_value", "Ordered value", "money"),
+            ("received_value", "Received value", "money"),
+            ("open_value", "Open value", "money"),
+        ),
+        (
+            ("orders", "Orders", "int"),
+            ("units_ordered", "Units ordered", "int"),
+            ("units_received", "Units received", "int"),
+            ("ordered_value", "Ordered value", "money"),
+            ("received_value", "Received value", "money"),
+            ("open_value", "Open value", "money"),
+        ),
+    ),
+    "erp.warehouse.movement_summary": (
+        (
+            ("key", "Group", "text"),
+            ("label", "Label", "text"),
+            ("movement_count", "Movements", "int"),
+            ("opening_qty", "Opening", "int"),
+            ("receipts_qty", "Receipts", "int"),
+            ("dispatch_qty", "Dispatch", "int"),
+            ("adjustment_qty", "Adjustments", "int"),
+            ("inbound_qty", "Inbound", "int"),
+            ("outbound_qty", "Outbound", "int"),
+            ("receipts_net_qty", "Receipts net", "int"),
+            ("net_change", "Net change", "int"),
+        ),
+        (
+            ("movement_count", "Movements", "int"),
+            ("opening_qty", "Opening", "int"),
+            ("receipts_qty", "Receipts", "int"),
+            ("dispatch_qty", "Dispatch", "int"),
+            ("adjustment_qty", "Adjustments", "int"),
+            ("inbound_qty", "Inbound", "int"),
+            ("outbound_qty", "Outbound", "int"),
+            ("receipts_net_qty", "Receipts net", "int"),
+            ("net_change", "Net change", "int"),
+        ),
+    ),
+    "erp.fulfillment.summary": (
+        (
+            ("key", "Group", "text"),
+            ("label", "Label", "text"),
+            ("dispatches", "Dispatches", "int"),
+            ("ordered_qty", "Ordered", "int"),
+            ("picked_qty", "Picked", "int"),
+            ("dispatched_qty", "Dispatched", "int"),
+            ("open_qty", "Open", "int"),
+            ("pick_fill_pct", "Pick fill %", "percent"),
+            ("order_fill_pct", "Order fill %", "percent"),
+        ),
+        (
+            ("dispatches", "Dispatches", "int"),
+            ("ordered_qty", "Ordered", "int"),
+            ("picked_qty", "Picked", "int"),
+            ("dispatched_qty", "Dispatched", "int"),
+            ("open_qty", "Open", "int"),
+            ("pick_fill_pct", "Pick fill %", "percent"),
+            ("order_fill_pct", "Order fill %", "percent"),
+            (
+                "dispatched_order_fill_pct",
+                "Dispatched-order fill %",
+                "percent",
+            ),
+        ),
+    ),
+}
+
+
+def _format_analytics_value(value: Any, kind: str) -> str:
+    """Format one verified tool value without changing or inventing it."""
+
+    if value is None:
+        return "—"
+    try:
+        if kind == "money":
+            return f"{float(value):,.2f}"
+        if kind == "percent":
+            return f"{float(value):.2f}"
+        if kind == "int":
+            return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+    return str(value)
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _analytics_fallback_title(tool_name: str, output: Mapping[str, Any]) -> str:
+    group_by = output.get("group_by") or "group"
+    if tool_name == "erp.finance.sales_summary":
+        basis = output.get("basis") or "unknown"
+        return f"Sales summary by {group_by} (basis: {basis})"
+    if tool_name == "erp.finance.purchase_summary":
+        basis = output.get("basis") or "unknown"
+        return f"Purchase summary by {group_by} (basis: {basis})"
+    if tool_name == "erp.warehouse.movement_summary":
+        return f"Stock movement summary by {group_by}"
+    return f"Fulfillment summary by {group_by}"
+
+
+def _analytics_fallback_lines(
+    tool_name: str,
+    output: Any,
+) -> list[str] | None:
+    """Render a deterministic summary from verified analytics tool output.
+
+    Returns ``None`` when the tool is not an analytics tool or its output does
+    not have the expected rows structure, so the caller can retain the existing
+    generic fallback behavior.
+    """
+
+    table = _ANALYTICS_FALLBACK_TABLES.get(tool_name)
+    if table is None or not isinstance(output, Mapping):
+        return None
+    rows = output.get("rows")
+    if not isinstance(rows, list):
+        return None
+
+    columns, total_columns = table
+    lines = [_analytics_fallback_title(tool_name, output)]
+
+    totals = output.get("totals")
+    if isinstance(totals, Mapping):
+        total_parts = [
+            f"{label}: {_format_analytics_value(totals.get(key), kind)}"
+            for key, label, kind in total_columns
+            if key in totals
+        ]
+        if total_parts:
+            currency = output.get("currency")
+            suffix = (
+                f" Currency: {currency}."
+                if isinstance(currency, str) and currency.strip()
+                else ""
+            )
+            lines.append("Totals: " + "; ".join(total_parts) + "." + suffix)
+
+    shown = len(rows)
+    row_count = output.get("row_count")
+    if (
+        isinstance(row_count, int)
+        and not isinstance(row_count, bool)
+        and row_count != shown
+    ):
+        summary = f"Showing {shown} of {row_count} rows."
+    else:
+        summary = f"Showing {shown} rows."
+    if output.get("truncated") is True:
+        summary += " Results are truncated."
+    lines.append(summary)
+
+    if rows:
+        lines.append("")
+        lines.append("| " + " | ".join(label for _, label, _ in columns) + " |")
+        lines.append("| " + " | ".join("---" for _ in columns) + " |")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            cells = [
+                _markdown_cell(_format_analytics_value(row.get(key), kind))
+                for key, _, kind in columns
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+    else:
+        lines.append("No rows matched the query.")
+
+    notes = output.get("notes")
+    if isinstance(notes, list):
+        note_lines = [
+            note.strip() for note in notes if isinstance(note, str) and note.strip()
+        ]
+        if note_lines:
+            lines.append("")
+            lines.append("Notes:")
+            lines.extend(f"- {note}" for note in note_lines)
+
+    return lines
 
 
 def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
@@ -122,12 +333,20 @@ def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
         return ()
     if _is_warehouse_list_question(text):
         return (_WAREHOUSE_LIST_TOOL,)
+    if any(term in text for term in ("movement", "inbound", "outbound", "stock movement")):
+        return ("erp.warehouse.movement_summary",)
     if any(term in text for term in ("inventory", "stock", "warehouse")):
         return ("erp.inventory.", "erp.warehouses.")
     if "sales order" in text:
         return ("erp.sales_orders.",)
     if any(term in text for term in ("dispatch", "shipment", "delivered")):
         return ("erp.dispatches.",)
+    if any(term in text for term in ("revenue", "gross profit", "gross margin", "invoiced", "total sales", "sales total")):
+        return ("erp.finance.sales_summary",)
+    if any(term in text for term in ("purchase", "procurement", "supplier", "spend")):
+        return ("erp.finance.purchase_summary",)
+    if any(term in text for term in ("fulfillment", "fulfilment", "fill rate", "pick fill", "order fill", "picked")):
+        return ("erp.fulfillment.summary",)
     if "product" in text or "sku" in text:
         if any(
             phrase in text
@@ -474,6 +693,45 @@ def _used_dispatch_tools(summaries: list[ToolCallSummary]) -> bool:
     )
 
 
+def _parse_batch_call(raw_call: Any) -> tuple[str, dict[str, Any]]:
+    """Extract a tool name and argument mapping from a multi-call decision."""
+
+    if not isinstance(raw_call, Mapping):
+        return "", {}
+    tool_name = raw_call.get("tool_name")
+    if not isinstance(tool_name, str):
+        tool_name = raw_call.get("name")
+    if not isinstance(tool_name, str):
+        tool_name = ""
+    arguments = raw_call.get("arguments")
+    return tool_name.strip(), (
+        dict(arguments) if isinstance(arguments, Mapping) else {}
+    )
+
+
+def _adapt_llm_client(client: LlmClient, registry: ToolRegistry) -> LlmClient:
+    """Wrap a raw Gemini SDK client in the provider-neutral adapter.
+
+    Provider selection normally supplies the adapter directly. This fallback
+    keeps direct ``GeminiClient`` injection working without changing the Gemini
+    production client.
+    """
+
+    try:
+        from backend.ai_providers.gemini.adapter import GeminiLlmClientAdapter
+        from backend.ai_providers.gemini.client import GeminiClient
+    except Exception:  # pragma: no cover - optional dependency safety
+        return client
+
+    if isinstance(client, GeminiClient):
+        return GeminiLlmClientAdapter(
+            client.config,
+            client=client,
+            tool_registry=registry,
+        )
+    return client
+
+
 class AgentOrchestrator:
     """Orchestrates natural-language question understanding, tool calling, and grounded answers."""
 
@@ -485,7 +743,7 @@ class AgentOrchestrator:
         registry: ToolRegistry,
         max_tool_calls: int = 5,
     ) -> None:
-        self.client = client
+        self.client = _adapt_llm_client(client, registry)
         self.runner = runner
         self.registry = registry
         self.max_tool_calls = max(1, max_tool_calls)
@@ -636,7 +894,41 @@ class AgentOrchestrator:
                 )
                 continue
 
-            # 5. Handle Final Answer
+            # 5. Handle Native Multi-Tool Call (Gemini adapter protocol)
+            if decision.action == "call_tools":
+                raw_calls = data.get("tool_calls") if isinstance(data, Mapping) else None
+                if not isinstance(raw_calls, list) or not raw_calls:
+                    messages.append(
+                        ChatMessage(role=ChatRole.ASSISTANT, content=raw_content)
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role=ChatRole.USER,
+                            content=(
+                                "The 'call_tools' action requires a non-empty "
+                                "'tool_calls' array. Please respond again."
+                            ),
+                        )
+                    )
+                    continue
+
+                tool_executions, early_result = self._process_tool_call_batch(
+                    raw_calls=raw_calls,
+                    raw_content=raw_content,
+                    messages=messages,
+                    executed_summaries=executed_summaries,
+                    executed_calls_set=executed_calls_set,
+                    successful_outputs=successful_outputs,
+                    tool_executions=tool_executions,
+                    grounding_requirement=grounding_requirement,
+                    iteration=iteration,
+                    session_id=session_id,
+                )
+                if early_result is not None:
+                    return early_result
+                continue
+
+            # 6. Handle Final Answer
             if decision.action == "final_answer":
                 answer_text = (decision.final_answer or "").strip()
                 if not answer_text:
@@ -798,6 +1090,182 @@ class AgentOrchestrator:
             session_id=session_id,
         )
 
+    def _process_tool_call_batch(
+        self,
+        *,
+        raw_calls: list[Any],
+        raw_content: str,
+        messages: list[ChatMessage],
+        executed_summaries: list[ToolCallSummary],
+        executed_calls_set: set[tuple[str, str]],
+        successful_outputs: list[tuple[str, Any]],
+        tool_executions: int,
+        grounding_requirement: tuple[str, ...] | None,
+        iteration: int,
+        session_id: str | None,
+    ) -> tuple[int, AgentExecutionResult | None]:
+        """Execute all tool calls returned in one native provider response.
+
+        This path is only used by clients that emit the ``call_tools`` decision
+        (currently the Gemini adapter). The single-call ``call_tool`` path used
+        by Ollama and Qwen3 is left unchanged.
+        """
+
+        messages.append(ChatMessage(role=ChatRole.ASSISTANT, content=raw_content))
+
+        # Only reject calls that repeat an earlier conversation turn. Identical
+        # calls inside one native batch are allowed: Gemini can legitimately
+        # request the same lookup more than once in a single response.
+        previous_calls = set(executed_calls_set)
+
+        for raw_call in raw_calls:
+            tool_name, arguments = _parse_batch_call(raw_call)
+
+            if tool_executions >= self.max_tool_calls:
+                executed_summaries.append(
+                    ToolCallSummary(
+                        tool_name=tool_name or "unknown",
+                        arguments=arguments,
+                        status=ToolExecutionStatus.CANCELLED.value,
+                    )
+                )
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=(
+                            f"Tool `{tool_name or 'unknown'}` execution was "
+                            "cancelled or timed out."
+                        ),
+                    )
+                )
+                continue
+
+            if not tool_name or not self.registry.exists(tool_name):
+                executed_summaries.append(
+                    ToolCallSummary(
+                        tool_name=tool_name or "unknown",
+                        arguments=arguments,
+                        status=ToolExecutionStatus.FAILED.value,
+                        error=f"Unknown tool: {tool_name or 'unknown'}",
+                    )
+                )
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=(
+                            f"Tool `{tool_name or 'unknown'}` failed with error "
+                            "[unknown_tool]: Tool is not recognized in the "
+                            "approved ERP catalog."
+                        ),
+                    )
+                )
+                continue
+
+            definition = self.registry.get(tool_name)
+            arguments = normalize_tool_arguments(arguments, definition)
+
+            args_key = json.dumps(arguments, sort_keys=True, default=str)
+            call_sig = (tool_name, args_key)
+            if call_sig in previous_calls:
+                executed_summaries.append(
+                    ToolCallSummary(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        status=ToolExecutionStatus.FAILED.value,
+                        error="Duplicate tool call with identical arguments.",
+                    )
+                )
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=(
+                            f"Tool `{tool_name}` was already called with "
+                            f"arguments {arguments}. Do not repeat identical "
+                            "calls."
+                        ),
+                    )
+                )
+                continue
+
+            request = ToolExecutionRequest(tool_name=tool_name, arguments=arguments)
+            result = self.runner.execute(request)
+            executed_calls_set.add(call_sig)
+
+            if result.started_at is not None:
+                tool_executions += 1
+
+            executed_summaries.append(
+                ToolCallSummary(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    status=result.status.value,
+                    duration_ms=result.duration_ms,
+                    error=result.error.message if result.error else None,
+                    output=(
+                        result.output
+                        if result.status is ToolExecutionStatus.SUCCEEDED
+                        else None
+                    ),
+                )
+            )
+
+            if result.status is ToolExecutionStatus.SUCCEEDED:
+                successful_outputs.append((tool_name, result.output))
+                output_str = json.dumps(
+                    result.output,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=f"Tool `{tool_name}` output:\n{output_str}",
+                    )
+                )
+            elif result.status is ToolExecutionStatus.FAILED:
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content="\n".join(
+                            _failure_feedback_lines(tool_name, result)
+                        ),
+                    )
+                )
+            else:  # CANCELLED / TIMEOUT
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=(
+                            f"Tool `{tool_name}` execution was cancelled or "
+                            "timed out."
+                        ),
+                    )
+                )
+
+        if grounding_requirement == (_WAREHOUSE_LIST_TOOL,):
+            warehouse_list = _authoritative_warehouse_list(successful_outputs)
+            if warehouse_list is not None:
+                return tool_executions, AgentExecutionResult(
+                    answer=warehouse_list,
+                    tool_calls=executed_summaries,
+                    status="completed",
+                    iterations=iteration,
+                    session_id=session_id,
+                )
+
+        if grounding_requirement == (_PRODUCT_COUNT_TOOL,):
+            product_count = _authoritative_product_count(successful_outputs)
+            if product_count is not None:
+                return tool_executions, AgentExecutionResult(
+                    answer=f"There are {product_count} products in the ERP.",
+                    tool_calls=executed_summaries,
+                    status="completed",
+                    iterations=iteration,
+                    session_id=session_id,
+                )
+
+        return tool_executions, None
+
     def _synthesize_final_answer(
         self,
         messages: list[ChatMessage],
@@ -835,8 +1303,19 @@ class AgentOrchestrator:
             final_resp = self.client.chat(messages, format="json", temperature=0.0)
             cleaned = _clean_json_text(final_resp.content)
             data = json.loads(cleaned)
-            final_decision = ToolSelectionDecision.model_validate(data)
-            final_text = (final_decision.final_answer or "").strip()
+            if isinstance(data, Mapping) and data.get("action") == "call_tools":
+                for raw_call in data.get("tool_calls") or []:
+                    tool_name, arguments = _parse_batch_call(raw_call)
+                    executed_summaries.append(
+                        ToolCallSummary(
+                            tool_name=tool_name or "unknown",
+                            arguments=arguments,
+                            status=ToolExecutionStatus.CANCELLED.value,
+                        )
+                    )
+            else:
+                final_decision = ToolSelectionDecision.model_validate(data)
+                final_text = (final_decision.final_answer or "").strip()
         except Exception:
             final_text = ""
 
@@ -991,6 +1470,12 @@ class AgentOrchestrator:
 
         lines: list[str] = [intro]
         for tool_name, output in successful_outputs:
+            analytics_lines = _analytics_fallback_lines(tool_name, output)
+            if analytics_lines is not None:
+                lines.append("")
+                lines.extend(analytics_lines)
+                continue
+
             rendered = json.dumps(output, ensure_ascii=False, default=str)
             if len(rendered) > _MAX_FALLBACK_OUTPUT_CHARS:
                 rendered = rendered[:_MAX_FALLBACK_OUTPUT_CHARS] + "... (truncated)"

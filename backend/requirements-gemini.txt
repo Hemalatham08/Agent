@@ -1,0 +1,6 @@
+# Optional dependency for the Gemini AI provider (Phase 2).
+# Not required for Ollama-only installations. Install with:
+#   pip install -r backend/requirements-gemini.txt
+#
+# Minimum version verified compatible with the Client / models API used here.
+google-genai>=1.0.0

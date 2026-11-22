@@ -192,6 +192,7 @@ class ChatResponse(BaseModel):
     status: str
     model: str
     error: str | None = None
+    charts: list[Any] = Field(default_factory=list)
 
 
 @app.post("/api/agent/chat", response_model=ChatResponse)
@@ -239,4 +240,5 @@ def chat_endpoint(request: ChatRequest, req: Request):
         status=result.status,
         model=model_name,
         error=result.error,
+        charts=result.charts,
     )
