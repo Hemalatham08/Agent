@@ -69,6 +69,24 @@ ERP_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
         metadata=dict(_ERP_READ_ONLY_METADATA),
     ),
     ToolDefinition(
+        name="erp.inventory.list",
+        description=(
+            "List inventory for all products across warehouses. Optionally "
+            "filter by warehouse_id. Returns product, warehouse, and stock "
+            "quantities. Bounded by limit (1-50, default 50)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "warehouse_id": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "additionalProperties": False,
+        },
+        version=_ERP_TOOL_VERSION,
+        metadata=dict(_ERP_READ_ONLY_METADATA),
+    ),
+    ToolDefinition(
         name="erp.warehouses.list",
         description="List available warehouses.",
         input_schema={

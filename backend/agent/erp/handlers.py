@@ -12,7 +12,7 @@ from backend.agent.erp.errors import (
     ErpInternalError,
     ErpInvalidArgumentsError,
 )
-from backend.agent.erp.service import ErpReadService
+from backend.agent.erp.service import ErpReadService, _MAX_LIST_LIMIT
 from backend.agent.tools.contracts import ToolExecutionContext
 from backend.agent.tools.validation import validate_arguments
 
@@ -44,6 +44,7 @@ class ErpToolHandlers:
             "erp.products.get": self.get_product,
             "erp.products.count": self.count_products,
             "erp.inventory.get": self.get_inventory,
+            "erp.inventory.list": self.list_inventory,
             "erp.warehouses.list": self.list_warehouses,
             "erp.inventory.low_stock": self.list_low_stock,
             "erp.sales_orders.get": self.get_sales_order,
@@ -123,6 +124,21 @@ class ErpToolHandlers:
             lambda args: self._service.get_inventory(
                 args["product_id"],
                 args.get("warehouse_id"),
+                timeout_seconds=context.timeout_seconds,
+            ),
+        )
+
+    def list_inventory(
+        self,
+        arguments: dict[str, JsonValue],
+        context: ToolExecutionContext,
+    ) -> dict[str, JsonValue]:
+        return self._handle(
+            "erp.inventory.list",
+            arguments,
+            lambda args: self._service.list_inventory(
+                args.get("warehouse_id"),
+                args.get("limit", _MAX_LIST_LIMIT),
                 timeout_seconds=context.timeout_seconds,
             ),
         )

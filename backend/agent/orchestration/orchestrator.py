@@ -19,6 +19,12 @@ from backend.agent.llm.models import (
     ChatRole,
     ToolSelectionDecision,
 )
+from backend.agent.orchestration.context import format_tool_output_message
+from backend.agent.orchestration.dependencies import (
+    DependencyStep,
+    format_dependency_feedback,
+    resolve_argument_dependencies,
+)
 from backend.agent.orchestration.models import (
     AgentExecutionResult,
     ToolCallSummary,
@@ -33,6 +39,12 @@ from backend.agent.tools.registry import ToolRegistry
 
 _DROP = object()
 _INTEGER_TEXT_PATTERN = re.compile(r"^[+-]?\d+$")
+
+# Optional execution plans are short, advisory metadata. These bounds keep a
+# model from using the plan field to smuggle oversized prompts into history.
+_MAX_EXECUTION_PLAN_STEPS = 8
+_MAX_EXECUTION_PLAN_STEP_CHARS = 160
+_EXECUTION_PLAN_TOOL_PATTERN = re.compile(r"\berp\.[a-z0-9_]+\.[a-z0-9_]+\b")
 
 _DISPATCH_TOOL_PREFIX = "erp.dispatches."
 _DELIVERY_SEMANTICS_NOTE = (
@@ -319,6 +331,126 @@ def _analytics_fallback_lines(
             lines.extend(f"- {note}" for note in note_lines)
 
     return lines
+
+
+# Column definitions for the human-readable fallback tables. Each entry is
+# (output key, display label, value kind). Only keys that exist on the
+# corresponding ERP tool output are used, so no values are ever invented.
+_PRODUCT_TABLE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("product_id", "Product ID", "text"),
+    ("sku", "SKU", "text"),
+    ("product_name", "Product name", "text"),
+    ("category", "Category", "text"),
+    ("material", "Material", "text"),
+    ("size", "Size", "text"),
+    ("grade", "Grade", "text"),
+    ("unit", "Unit", "text"),
+)
+
+_INVENTORY_TABLE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("product_id", "Product ID", "text"),
+    ("product_name", "Product name", "text"),
+    ("warehouse_id", "Warehouse ID", "text"),
+    ("warehouse_name", "Warehouse", "text"),
+    ("on_hand_qty", "On hand", "int"),
+    ("reserved_qty", "Reserved", "int"),
+    ("free_stock", "Free stock", "int"),
+    ("reorder_level", "Reorder level", "int"),
+    ("low_stock", "Low stock", "text"),
+)
+
+_WAREHOUSE_TABLE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("warehouse_id", "Warehouse ID", "text"),
+    ("warehouse_name", "Warehouse name", "text"),
+    ("city", "City", "text"),
+)
+
+
+def _render_simple_table(
+    title: str,
+    columns: tuple[tuple[str, str, str], ...],
+    rows: list[Any],
+    output: Any,
+) -> list[str]:
+    """Render a title, row summary, and markdown table from verified rows.
+
+    Never invents values: missing fields render as ``—`` and actual zero
+    quantities remain ``0``.
+    """
+
+    lines: list[str] = [title]
+    shown = len(rows)
+    row_count = output.get("row_count") if isinstance(output, Mapping) else None
+    if (
+        isinstance(row_count, int)
+        and not isinstance(row_count, bool)
+        and row_count != shown
+    ):
+        summary = f"Showing {shown} of {row_count} rows."
+    else:
+        summary = f"Showing {shown} rows."
+    if isinstance(output, Mapping) and output.get("truncated") is True:
+        summary += " Results are truncated."
+    lines.append(summary)
+
+    if rows:
+        lines.append("")
+        lines.append("| " + " | ".join(label for _, label, _ in columns) + " |")
+        lines.append("| " + " | ".join("---" for _ in columns) + " |")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            cells = [
+                _markdown_cell(_format_analytics_value(row.get(key), kind))
+                for key, _, kind in columns
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+    else:
+        lines.append("No rows matched the query.")
+    return lines
+
+
+def _products_table_lines(output: Any) -> list[str] | None:
+    if not isinstance(output, Mapping):
+        return None
+    items = output.get("items")
+    if not isinstance(items, list):
+        return None
+    return _render_simple_table("Products", _PRODUCT_TABLE_COLUMNS, items, output)
+
+
+def _inventory_table_lines(output: Any) -> list[str] | None:
+    if not isinstance(output, Mapping):
+        return None
+    items = output.get("items")
+    if not isinstance(items, list):
+        return None
+    return _render_simple_table("Inventory", _INVENTORY_TABLE_COLUMNS, items, output)
+
+
+def _warehouses_table_lines(output: Any) -> list[str] | None:
+    if not isinstance(output, Mapping):
+        return None
+    items = output.get("items")
+    if not isinstance(items, list):
+        return None
+    return _render_simple_table("Warehouses", _WAREHOUSE_TABLE_COLUMNS, items, output)
+
+
+def _simple_table_fallback_lines(tool_name: str, output: Any) -> list[str] | None:
+    """Return readable table lines for product, inventory, and warehouse tools.
+
+    Returns ``None`` for tools without a dedicated table renderer so the
+    caller can retain the existing generic JSON fallback behavior.
+    """
+
+    if tool_name == "erp.products.search":
+        return _products_table_lines(output)
+    if tool_name in ("erp.inventory.get", "erp.inventory.list", "erp.inventory.low_stock"):
+        return _inventory_table_lines(output)
+    if tool_name == "erp.warehouses.list":
+        return _warehouses_table_lines(output)
+    return None
 
 
 def _required_tool_evidence(question: str) -> tuple[str, ...] | None:
@@ -709,6 +841,79 @@ def _parse_batch_call(raw_call: Any) -> tuple[str, dict[str, Any]]:
     )
 
 
+def _normalize_execution_plan(
+    raw_plan: Any,
+) -> tuple[list[str] | None, str | None]:
+    """Normalize an optional model-supplied execution plan.
+
+    Returns ``(plan, error)``. ``plan`` is ``None`` when the field is absent,
+    empty, or unusable. The plan is descriptive metadata only; it is never
+    used to authorize or execute a tool.
+    """
+
+    if raw_plan is None:
+        return None, None
+    if not isinstance(raw_plan, list):
+        return None, (
+            "The 'execution_plan' field must be a JSON array of short strings "
+            "or null."
+        )
+
+    steps: list[str] = []
+    for item in raw_plan:
+        if not isinstance(item, str):
+            return None, "Each 'execution_plan' entry must be a short string."
+        step = item.strip()
+        if not step:
+            continue
+        if len(step) > _MAX_EXECUTION_PLAN_STEP_CHARS:
+            return None, (
+                "Each 'execution_plan' step must be at most "
+                f"{_MAX_EXECUTION_PLAN_STEP_CHARS} characters."
+            )
+        steps.append(step)
+
+    if len(steps) > _MAX_EXECUTION_PLAN_STEPS:
+        return None, (
+            "The 'execution_plan' may contain at most "
+            f"{_MAX_EXECUTION_PLAN_STEPS} steps."
+        )
+
+    return (steps or None), None
+
+
+def _validate_execution_plan(
+    raw_plan: Any,
+    registry: ToolRegistry,
+) -> tuple[list[str] | None, str | None]:
+    """Validate an optional plan against the approved ERP tool catalog.
+
+    The plan never authorizes execution. This helper only checks that the
+    metadata is well formed and that any tool names it mentions are registered.
+    Actual tool calls still pass through ``ToolRegistry.exists`` and the normal
+    argument/runner validation.
+    """
+
+    plan, error = _normalize_execution_plan(raw_plan)
+    if error is not None or plan is None:
+        return plan, error
+
+    unknown: list[str] = []
+    for step in plan:
+        for tool_name in _EXECUTION_PLAN_TOOL_PATTERN.findall(step):
+            if not registry.exists(tool_name) and tool_name not in unknown:
+                unknown.append(tool_name)
+    if unknown:
+        referenced = ", ".join(f"`{name}`" for name in unknown)
+        return None, (
+            "The execution plan references tools that are not in the approved "
+            f"ERP catalog: {referenced}. Plans may only describe steps using "
+            "approved tools."
+        )
+
+    return plan, None
+
+
 def _adapt_llm_client(client: LlmClient, registry: ToolRegistry) -> LlmClient:
     """Wrap a raw Gemini SDK client in the provider-neutral adapter.
 
@@ -820,9 +1025,11 @@ class AgentOrchestrator:
         executed_summaries: list[ToolCallSummary] = []
         executed_calls_set: set[tuple[str, str]] = set()
         successful_outputs: list[tuple[str, Any]] = []
+        execution_steps: list[DependencyStep] = []
 
         iteration = 0
         tool_executions = 0
+        plan_feedback_given = False
 
         while (
             tool_executions < self.max_tool_calls
@@ -877,9 +1084,24 @@ class AgentOrchestrator:
             cleaned_json = _clean_json_text(raw_content)
 
             try:
-                data = json.loads(cleaned_json)
-                decision = ToolSelectionDecision.model_validate(data)
+                data: Any = json.loads(cleaned_json)
             except Exception:
+                data = None
+
+            plan_error: str | None = None
+            if isinstance(data, Mapping):
+                # Validate the optional plan before schema validation. A
+                # malformed plan is replaced with None so it cannot make the
+                # decision itself unparseable, and so it can never authorize
+                # a tool call.
+                data = dict(data)
+                plan, plan_error = _validate_execution_plan(
+                    data.get("execution_plan"),
+                    self.registry,
+                )
+                data["execution_plan"] = plan
+
+            if data is None:
                 # Give model one chance to correct its JSON output
                 messages.append(ChatMessage(role=ChatRole.ASSISTANT, content=raw_content))
                 messages.append(
@@ -888,11 +1110,49 @@ class AgentOrchestrator:
                         content=(
                             "Your previous response was not valid JSON conforming to the schema. "
                             "Please respond with a single valid JSON object with keys 'thought', 'action', "
-                            "'tool_name', 'arguments', and 'final_answer'."
+                            "'tool_name', 'arguments', 'final_answer', and optional 'execution_plan'."
                         ),
                     )
                 )
                 continue
+
+            try:
+                decision = ToolSelectionDecision.model_validate(data)
+            except Exception:
+                messages.append(ChatMessage(role=ChatRole.ASSISTANT, content=raw_content))
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=(
+                            "Your previous response did not conform to the decision schema. "
+                            "Please respond with a single valid JSON object with keys 'thought', 'action', "
+                            "'tool_name', 'arguments', 'final_answer', and optional 'execution_plan'."
+                        ),
+                    )
+                )
+                continue
+
+            if plan_error is not None:
+                if not plan_feedback_given:
+                    # Give the model exactly one chance to correct its plan.
+                    plan_feedback_given = True
+                    messages.append(
+                        ChatMessage(role=ChatRole.ASSISTANT, content=raw_content)
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role=ChatRole.USER,
+                            content=(
+                                f"Your execution plan is invalid: {plan_error} "
+                                "Respond again with a corrected plan, or omit "
+                                "'execution_plan' for a simple request."
+                            ),
+                        )
+                    )
+                    continue
+                # A correction was already requested. Do not retry forever:
+                # ignore the invalid plan and continue with the requested
+                # action under the normal validation rules.
 
             # 5. Handle Native Multi-Tool Call (Gemini adapter protocol)
             if decision.action == "call_tools":
@@ -919,6 +1179,7 @@ class AgentOrchestrator:
                     executed_summaries=executed_summaries,
                     executed_calls_set=executed_calls_set,
                     successful_outputs=successful_outputs,
+                    execution_steps=execution_steps,
                     tool_executions=tool_executions,
                     grounding_requirement=grounding_requirement,
                     iteration=iteration,
@@ -971,6 +1232,29 @@ class AgentOrchestrator:
 
                 # Validate and normalize model arguments against the tool schema
                 definition = self.registry.get(tool_name)
+
+                # Resolve explicit $steps references before normalization. The
+                # resolver only reads earlier successful execution outputs and
+                # never authorizes a tool or bypasses normal validation.
+                arguments, dependency_issues = resolve_argument_dependencies(
+                    arguments,
+                    definition,
+                    execution_steps,
+                )
+                if dependency_issues:
+                    messages.append(
+                        ChatMessage(role=ChatRole.ASSISTANT, content=raw_content)
+                    )
+                    messages.append(
+                        ChatMessage(
+                            role=ChatRole.USER,
+                            content=format_dependency_feedback(
+                                dependency_issues
+                            ),
+                        )
+                    )
+                    continue
+
                 arguments = normalize_tool_arguments(arguments, definition)
 
                 # Check for repeated identical tool call
@@ -1000,6 +1284,19 @@ class AgentOrchestrator:
                 # tool-call budget; pre-flight validation failures do not.
                 if result.started_at is not None:
                     tool_executions += 1
+                    execution_steps.append(
+                        DependencyStep(
+                            step_number=len(execution_steps) + 1,
+                            tool_name=tool_name,
+                            status=result.status.value,
+                            output=(
+                                result.output
+                                if result.status
+                                is ToolExecutionStatus.SUCCEEDED
+                                else None
+                            ),
+                        )
+                    )
 
                 summary = ToolCallSummary(
                     tool_name=tool_name,
@@ -1042,11 +1339,13 @@ class AgentOrchestrator:
                                 iterations=iteration,
                                 session_id=session_id,
                             )
-                    output_str = json.dumps(result.output, ensure_ascii=False, default=str)
                     messages.append(
                         ChatMessage(
                             role=ChatRole.USER,
-                            content=f"Tool `{tool_name}` output:\n{output_str}",
+                            content=format_tool_output_message(
+                                tool_name,
+                                result.output,
+                            ),
                         )
                     )
                 elif result.status is ToolExecutionStatus.FAILED:
@@ -1099,6 +1398,7 @@ class AgentOrchestrator:
         executed_summaries: list[ToolCallSummary],
         executed_calls_set: set[tuple[str, str]],
         successful_outputs: list[tuple[str, Any]],
+        execution_steps: list[DependencyStep],
         tool_executions: int,
         grounding_requirement: tuple[str, ...] | None,
         iteration: int,
@@ -1162,6 +1462,25 @@ class AgentOrchestrator:
                 continue
 
             definition = self.registry.get(tool_name)
+
+            # Resolve explicit $steps references before normalization. Calls in
+            # one native batch execute in order, so a later call may reference
+            # an earlier successful call in the same batch. A forward reference
+            # to a later call in the batch is rejected.
+            arguments, dependency_issues = resolve_argument_dependencies(
+                arguments,
+                definition,
+                execution_steps,
+            )
+            if dependency_issues:
+                messages.append(
+                    ChatMessage(
+                        role=ChatRole.USER,
+                        content=format_dependency_feedback(dependency_issues),
+                    )
+                )
+                continue
+
             arguments = normalize_tool_arguments(arguments, definition)
 
             args_key = json.dumps(arguments, sort_keys=True, default=str)
@@ -1193,6 +1512,18 @@ class AgentOrchestrator:
 
             if result.started_at is not None:
                 tool_executions += 1
+                execution_steps.append(
+                    DependencyStep(
+                        step_number=len(execution_steps) + 1,
+                        tool_name=tool_name,
+                        status=result.status.value,
+                        output=(
+                            result.output
+                            if result.status is ToolExecutionStatus.SUCCEEDED
+                            else None
+                        ),
+                    )
+                )
 
             executed_summaries.append(
                 ToolCallSummary(
@@ -1211,15 +1542,13 @@ class AgentOrchestrator:
 
             if result.status is ToolExecutionStatus.SUCCEEDED:
                 successful_outputs.append((tool_name, result.output))
-                output_str = json.dumps(
-                    result.output,
-                    ensure_ascii=False,
-                    default=str,
-                )
                 messages.append(
                     ChatMessage(
                         role=ChatRole.USER,
-                        content=f"Tool `{tool_name}` output:\n{output_str}",
+                        content=format_tool_output_message(
+                            tool_name,
+                            result.output,
+                        ),
                     )
                 )
             elif result.status is ToolExecutionStatus.FAILED:
@@ -1314,12 +1643,39 @@ class AgentOrchestrator:
                         )
                     )
             else:
-                final_decision = ToolSelectionDecision.model_validate(data)
+                # Plans are not actionable once the budget is exhausted; drop
+                # any plan so malformed metadata cannot block synthesis.
+                final_payload = dict(data) if isinstance(data, Mapping) else data
+                if isinstance(final_payload, dict):
+                    final_payload.pop("execution_plan", None)
+                final_decision = ToolSelectionDecision.model_validate(final_payload)
                 final_text = (final_decision.final_answer or "").strip()
         except Exception:
             final_text = ""
 
         if final_text:
+            # When verified tool data exists and the model's answer would be
+            # returned verbatim (no authoritative replacement), prefer the
+            # deterministic fallback so an incomplete model answer cannot drop
+            # relevant successful ERP outputs. The normal in-loop final_answer
+            # path is left untouched. Product count and warehouse list answers
+            # keep their authoritative replacement because _grounded_answer
+            # already renders them from verified tool data.
+            verbatim_case = grounding_requirement is None or grounding_requirement not in (
+                (_PRODUCT_COUNT_TOOL,),
+                (_WAREHOUSE_LIST_TOOL,),
+            )
+            evidence_ok = grounding_requirement is None or _has_required_evidence(
+                grounding_requirement, successful_outputs
+            )
+            if successful_outputs and verbatim_case and evidence_ok:
+                return AgentExecutionResult(
+                    answer=self._fallback_answer(executed_summaries, successful_outputs),
+                    tool_calls=executed_summaries,
+                    status="completed",
+                    iterations=iteration,
+                    session_id=session_id,
+                )
             answer, status, error = _grounded_answer(
                 grounding_requirement,
                 final_text,
@@ -1474,6 +1830,16 @@ class AgentOrchestrator:
             if analytics_lines is not None:
                 lines.append("")
                 lines.extend(analytics_lines)
+                continue
+
+            simple_lines = _simple_table_fallback_lines(tool_name, output)
+            if simple_lines is not None:
+                rendered = "\n".join(simple_lines)
+                if len(rendered) > _MAX_FALLBACK_OUTPUT_CHARS:
+                    rendered = rendered[:_MAX_FALLBACK_OUTPUT_CHARS] + "... (truncated)"
+                lines.append("")
+                lines.append(f"`{tool_name}`:")
+                lines.extend(rendered.split("\n"))
                 continue
 
             rendered = json.dumps(output, ensure_ascii=False, default=str)

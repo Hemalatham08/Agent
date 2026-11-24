@@ -47,7 +47,14 @@ class ModelInfo(BaseModel):
 
 
 class ToolSelectionDecision(BaseModel):
-    """Structured decision output from the reasoning model."""
+    """Structured decision output from the reasoning model.
+
+    ``execution_plan`` is optional advisory metadata for complex, multi-step
+    requests. It is a list of short action descriptions and never authorizes a
+    tool call: every step must still be executed through the normal
+    ``call_tool`` action with validated arguments. Responses that omit the
+    field remain valid and parse to ``None``.
+    """
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -56,3 +63,4 @@ class ToolSelectionDecision(BaseModel):
     tool_name: str | None = None
     arguments: dict[str, Any] | None = None
     final_answer: str | None = None
+    execution_plan: list[str] | None = None
