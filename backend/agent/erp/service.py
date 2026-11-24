@@ -187,6 +187,25 @@ ORDER BY i.warehouse_id ASC
 LIMIT ?
 """
 
+_INVENTORY_LIST_SQL = """
+SELECT
+    p.product_id,
+    p.product_name,
+    i.warehouse_id,
+    w.warehouse_name,
+    i.on_hand_qty,
+    i.reserved_qty,
+    (i.on_hand_qty - i.reserved_qty) AS free_stock,
+    p.reorder_level,
+    ((i.on_hand_qty - i.reserved_qty) <= p.reorder_level) AS low_stock
+FROM inventory AS i
+JOIN products AS p ON p.product_id = i.product_id
+JOIN warehouses AS w ON w.warehouse_id = i.warehouse_id
+WHERE i.warehouse_id = COALESCE(?, i.warehouse_id)
+ORDER BY p.product_id ASC, i.warehouse_id ASC
+LIMIT ?
+"""
+
 _WAREHOUSE_LIST_SQL = """
 SELECT
     warehouse_id,
@@ -653,6 +672,42 @@ class ErpReadService:
             for row in rows[:normalized_limit]
         ]
         return LowStockResult(
+            items=items,
+            row_count=len(items),
+            truncated=len(rows) > normalized_limit,
+        )
+
+    def list_inventory(
+        self,
+        warehouse_id: str | None = None,
+        limit: int = _MAX_LIST_LIMIT,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> InventoryResult:
+        normalized_warehouse_id = _optional_identifier(
+            warehouse_id,
+            "warehouse_id",
+        )
+        normalized_limit = _validate_limit(
+            limit,
+            "limit",
+            _MAX_LIST_LIMIT,
+        )
+        deadline = self._deadline(timeout_seconds)
+
+        if normalized_warehouse_id is not None:
+            self._ensure_warehouse_exists(normalized_warehouse_id, deadline)
+        parameters: tuple[object, ...] = (
+            normalized_warehouse_id,
+            normalized_limit + 1,
+        )
+
+        rows = self._fetch_all(_INVENTORY_LIST_SQL, parameters, deadline)
+        items = [
+            self._map_inventory_row(row, InventoryRow)
+            for row in rows[:normalized_limit]
+        ]
+        return InventoryResult(
             items=items,
             row_count=len(items),
             truncated=len(rows) > normalized_limit,
